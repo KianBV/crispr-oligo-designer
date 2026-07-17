@@ -1,0 +1,11 @@
+# Normalise line endings across platforms
+* text=auto eol=lf
+
+# R and config sources always LF
+*.R    text eol=lf
+*.Rmd  text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+# Binary assets
+*.xlsx binary

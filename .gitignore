@@ -1,0 +1,24 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# App scratch / outputs
+scratch_*.R
+outputs/
+*.xlsx.filled
+MicrosynthOrder_filled*.xlsx
+generated_oligos_*.csv
+run_summary_*.txt
+
+# Genome cache (large, re-downloadable)
+.ecoli_grna_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep the templates folder but not any real Microsynth template that may be
+# proprietary — uncomment the next line if you do NOT want to commit it:
+# templates/*.xlsx

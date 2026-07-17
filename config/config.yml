@@ -1,0 +1,83 @@
+# ==============================================================================
+# CRISPR Oligo Designer — user configuration
+# ==============================================================================
+# Edit these values to change the pipeline defaults. Anything you set here is
+# also shown (and can be overridden) in the app's Settings panel. After editing,
+# restart the app. Lines starting with '#' are comments.
+# ==============================================================================
+
+design:
+  # "Microsynth oligo size": length (bp) of the single-stranded homology-arm
+  # (repair template) oligo. Default 100 bp.
+  oligo_size: 100
+
+  # Maximum distance (bp) allowed between the PAM and the target codon.
+  max_pam_distance: 30
+
+  # Minimum cassette score for a gRNA candidate to be kept.
+  min_score_threshold: 3
+
+  # Seed length and max mismatches for off-target analysis.
+  seed_length: 11
+  max_mismatches: 4
+
+  # Number of ranked designs generated per mutation.
+  top_n: 3
+
+  # CPU cores for the design run (1 = sequential; >1 uses parallel processing).
+  n_cores: 1
+
+microsynth:
+  # Path to the official Microsynth order-form template (.xlsx).
+  # Place the file in the templates/ folder and keep this path pointing at it.
+  template_path: "templates/MicrosynthUploadFormDNA__2_.xlsx"
+  sheet: "DNA Order"
+
+  # gRNA Gibson-assembly primer 3' homology tails. Each primer is
+  #   <protospacer or its reverse complement> + <tail>
+  # (tail appended at the 3' end). Tails are lowercase by convention so the
+  # vector-homology region is visually distinct from the protospacer.
+  fwd_tail: "gttttagagctagaaatagcaagt"   # first 24 nt of the sgRNA scaffold
+  rev_tail: "actagtattatacctaggactgag"   # revcomp of the J23119 promoter 3' end
+
+  # Oligo name suffixes.
+  fwd_name_suffix: "_pEcgRNA_fw_gibson"
+  rev_name_suffix: "_pEcgRNA_rv_gibson"
+  ha_name_suffix: "_HA"
+
+  # Number of 5' bases protected by phosphorothioate (PTO) bonds on the
+  # homology-arm oligo.
+  pto_n_bases: 4
+
+  # Default column values written into the order form.
+  purification: "DES"
+  scale: "0.04"
+  condition: "Dried"
+  datasheet: "Standard"
+  aliquots: "No"
+
+export:
+  # Default minimum score used when selecting top-ranked designs for the order form.
+  min_score_filter: 3.0
+
+genome:
+  # Custom cache directory for the downloaded genome/annotations.
+  # Leave empty ("") to use the default (~/.ecoli_grna_cache).
+  cache_dir: ""
+
+  # Force re-download of the genome/annotations on the next run.
+  force_download: false
+
+  # Strain shown selected by default in the app (must be a key of 'strains').
+  default_strain: "BW25113 (Keio parent, CP009273.1)"
+
+  # Selectable standard strains: "label shown in the app": NCBI nuccore accession.
+  # Add, remove or correct entries here — the app reads this list directly.
+  # (Users can also upload their own genome FASTA + GFF instead of a strain.)
+  strains:
+    "BW25113 (Keio parent, CP009273.1)": "CP009273.1"
+    "MG1655 (K-12, U00096.3)": "U00096.3"
+    "W3110 (K-12, AP009048.1)": "AP009048.1"
+    "DH5alpha (CP026085.1)": "CP026085.1"
+    "BL21(DE3) (CP001509.3)": "CP001509.3"
+    "Nissle 1917 (CP007799.1)": "CP007799.1"

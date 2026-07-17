@@ -1,0 +1,1429 @@
+---
+title: "gDNA - FAST Version (Fixed)"
+author: "Kian Bigovic Villi"
+date: "2026-01-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#!/usr/bin/env Rscript
+
+# ==============================================================================
+# gRNA Selection - FAST VERSION
+# ==============================================================================
+#
+# Key optimizations:
+#   1. Use Biostrings::vcountPDict for FAST off-target counting
+#   2. Pre-filter candidates using seed matching (hash lookup)
+#   3. Skip full genome scan when possible
+#   4. Parallel processing with mclapply (lower overhead than future)
+#
+# FIX APPLIED: Corrected genomic coordinate calculation for minus-strand genes
+#   in off-target exclusion. Previously, the on-target position was computed as
+#   gene_start + abs_pos - 1 for ALL genes, but for minus-strand genes the
+#   gene_sequence is reverse-complemented, so position 1 maps to genomic_end.
+#   The correct formula for minus-strand genes is: gene_end - abs_pos + 1.
+#   Without this fix, on-target sites in minus-strand genes were never excluded
+#   from off-target counts, inflating seed_matches and off_target_count.
+#
+# ==============================================================================
+
+# Load required packages
+install_if_missing <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE)
+    } else {
+      install.packages(pkg, repos = "https://cloud.r-project.org")
+    }
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+cat("Loading required packages...\n")
+install_if_missing("Biostrings", bioc = TRUE)
+install_if_missing("GenomicFeatures", bioc = TRUE)
+install_if_missing("rtracklayer", bioc = TRUE)
+install_if_missing("data.table")
+install_if_missing("stringr")
+install_if_missing("dplyr")
+install_if_missing("parallel")
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+ECOLI_BW25113_ACCESSION <- "CP009273.1"
+ECOLI_BW25113_GENOME_URL <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=CP009273.1&rettype=fasta&retmode=text"
+ECOLI_BW25113_GFF_URL <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=CP009273.1&rettype=gff3&retmode=text"
+GENOME_CACHE_DIR <- file.path(Sys.getenv("HOME"), ".ecoli_grna_cache")
+
+CODON_TABLE <- list(
+  "F" = c("TTT", "TTC"), "L" = c("TTA", "TTG", "CTT", "CTC", "CTA", "CTG"),
+  "I" = c("ATT", "ATC", "ATA"), "M" = c("ATG"),
+  "V" = c("GTT", "GTC", "GTA", "GTG"), "S" = c("TCT", "TCC", "TCA", "TCG", "AGT", "AGC"),
+  "P" = c("CCT", "CCC", "CCA", "CCG"), "T" = c("ACT", "ACC", "ACA", "ACG"),
+  "A" = c("GCT", "GCC", "GCA", "GCG"), "Y" = c("TAT", "TAC"),
+  "H" = c("CAT", "CAC"), "Q" = c("CAA", "CAG"),
+  "N" = c("AAT", "AAC"), "K" = c("AAA", "AAG"),
+  "D" = c("GAT", "GAC"), "E" = c("GAA", "GAG"),
+  "C" = c("TGT", "TGC"), "W" = c("TGG"),
+  "R" = c("CGT", "CGC", "CGA", "CGG", "AGA", "AGG"),
+  "G" = c("GGT", "GGC", "GGA", "GGG"), "*" = c("TAA", "TAG", "TGA")
+)
+
+REVERSE_CODON_TABLE <- unlist(lapply(names(CODON_TABLE), function(aa) {
+  setNames(rep(aa, length(CODON_TABLE[[aa]])), CODON_TABLE[[aa]])
+}))
+
+SPACER1 <- "TCCTCTGGCGGAAAGCCT"
+SPACER2 <- "GATC"
+J23119_PROMOTER <- "TTGACAGCTAGCTCAGTCCTAGGTATAATACTAGT"
+SGRNA_HANDLE <- "GTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAG"
+
+MAX_PAM_DISTANCE <- 30
+MIN_SCORE_THRESHOLD <- 3
+SEED_LENGTH <- 11
+MAX_MISMATCHES <- 4
+
+ECOLI_CODON_FREQ <- c(
+  "TTT" = 0.58, "TTC" = 0.42,
+  "TTA" = 0.14, "TTG" = 0.13, "CTT" = 0.12, "CTC" = 0.10, "CTA" = 0.04, "CTG" = 0.47,
+  "ATT" = 0.51, "ATC" = 0.42, "ATA" = 0.08,
+  "ATG" = 1.00,
+  "GTT" = 0.26, "GTC" = 0.22, "GTA" = 0.15, "GTG" = 0.37,
+  "TCT" = 0.17, "TCC" = 0.15, "TCA" = 0.14, "TCG" = 0.14, "AGT" = 0.16, "AGC" = 0.25,
+  "CCT" = 0.18, "CCC" = 0.13, "CCA" = 0.20, "CCG" = 0.49,
+  "ACT" = 0.19, "ACC" = 0.40, "ACA" = 0.13, "ACG" = 0.27,
+  "GCT" = 0.18, "GCC" = 0.26, "GCA" = 0.21, "GCG" = 0.36,
+  "TAT" = 0.59, "TAC" = 0.41,
+  "CAT" = 0.57, "CAC" = 0.43,
+  "CAA" = 0.34, "CAG" = 0.66,
+  "AAT" = 0.49, "AAC" = 0.51,
+  "AAA" = 0.74, "AAG" = 0.26,
+  "GAT" = 0.63, "GAC" = 0.37,
+  "GAA" = 0.68, "GAG" = 0.32,
+  "TGT" = 0.46, "TGC" = 0.54,
+  "TGG" = 1.00,
+  "CGT" = 0.36, "CGC" = 0.36, "CGA" = 0.07, "CGG" = 0.11, "AGA" = 0.07, "AGG" = 0.04,
+  "GGT" = 0.35, "GGC" = 0.37, "GGA" = 0.13, "GGG" = 0.15,
+  "TAA" = 0.61, "TAG" = 0.09, "TGA" = 0.30
+)
+# ==============================================================================
+# GENOME LOADING
+# ==============================================================================
+
+ensure_cache_dir <- function() {
+  if (!dir.exists(GENOME_CACHE_DIR)) dir.create(GENOME_CACHE_DIR, recursive = TRUE)
+}
+
+download_ecoli_genome <- function(force_download = FALSE) {
+  ensure_cache_dir()
+  cache_file <- file.path(GENOME_CACHE_DIR, "ecoli_BW25113.fasta")
+  
+  if (!force_download && file.exists(cache_file)) {
+    cat("Loading cached genome from:", cache_file, "\n")
+    return(Biostrings::readDNAStringSet(cache_file))
+  }
+  
+  cat("Downloading E. coli BW25113 genome...\n")
+  download.file(ECOLI_BW25113_GENOME_URL, cache_file, mode = "wb", quiet = TRUE)
+  Biostrings::readDNAStringSet(cache_file)
+}
+
+download_ecoli_annotations <- function(force_download = FALSE) {
+  ensure_cache_dir()
+  cache_file <- file.path(GENOME_CACHE_DIR, "ecoli_BW25113.gff")
+  
+  if (!force_download && file.exists(cache_file)) {
+    cat("Loading cached annotations...\n")
+    return(rtracklayer::import(cache_file))
+  }
+  
+  cat("Downloading annotations...\n")
+  tryCatch({
+    download.file(ECOLI_BW25113_GFF_URL, cache_file, mode = "wb", quiet = TRUE)
+    rtracklayer::import(cache_file)
+  }, error = function(e) NULL)
+}
+
+extract_gene_sequences <- function(genome, annotations) {
+  cds <- annotations[annotations$type == "CDS"]
+  if (length(cds) == 0) cds <- annotations[annotations$type == "gene"]
+  
+  genome_seq <- genome[[1]]
+  gene_sequences <- list()
+  gene_metadata <- list()
+  
+  for (i in seq_along(cds)) {
+    feature <- cds[i]
+    gene_name <- feature$gene %||% feature$Name %||% feature$locus_tag
+    if (is.null(gene_name) || is.na(gene_name)) next
+    
+    start_pos <- BiocGenerics::start(feature)
+    end_pos <- BiocGenerics::end(feature)
+    strand <- as.character(BiocGenerics::strand(feature))
+    
+    seq <- Biostrings::subseq(genome_seq, start_pos, end_pos)
+    if (strand == "-") seq <- Biostrings::reverseComplement(seq)
+    
+    gene_sequences[[gene_name]] <- as.character(seq)
+    gene_metadata[[gene_name]] <- list(
+      genomic_start = start_pos, genomic_end = end_pos, strand = strand
+    )
+  }
+  
+  list(sequences = gene_sequences, metadata = gene_metadata)
+}
+
+# Null coalescing operator (handles vectors properly)
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || (length(a) == 1 && is.na(a))) b else a
+
+# Codon usage from genome
+compute_codon_usage <- function(gene_sequences) {
+  cat("Computing codon usage from", length(gene_sequences), "coding sequences...\n")
+  
+  all_codons <- character(0)
+  for (seq in gene_sequences) {
+    seq <- toupper(seq)
+    n_codons <- nchar(seq) %/% 3
+    if (n_codons < 1) next
+    starts <- seq(1, n_codons * 3, by = 3)
+    ends <- seq(3, n_codons * 3, by = 3)
+    codons <- substring(seq, starts, ends)
+    all_codons <- c(all_codons, codons)
+  }
+  
+  # Raw counts
+  codon_counts <- table(factor(all_codons, levels = names(REVERSE_CODON_TABLE)))
+  
+  # Convert to relative frequency within each amino acid family
+  freq <- numeric(length(codon_counts))
+  names(freq) <- names(codon_counts)
+  
+  for (aa in names(CODON_TABLE)) {
+    codons_for_aa <- CODON_TABLE[[aa]]
+    aa_total <- sum(codon_counts[codons_for_aa])
+    if (aa_total > 0) {
+      for (cdn in codons_for_aa) {
+        freq[cdn] <- as.numeric(codon_counts[cdn]) / aa_total
+      }
+    }
+  }
+  
+  cat("  Counted", format(length(all_codons), big.mark = ","), "codons\n")
+  freq
+}
+
+# ==============================================================================
+# FAST OFF-TARGET ANALYSIS USING BIOSTRINGS
+# ==============================================================================
+
+#' Build optimized PAM index with DNAStringSet for fast matching
+build_pam_index_fast <- function(genome_sequence) {
+  cat("Building PAM index...\n")
+  
+  genome_seq <- toupper(genome_sequence)
+  genome_length <- nchar(genome_seq)
+  
+  # Find PAM sites
+  fwd_matches <- gregexpr("(?=.GG)", genome_seq, perl = TRUE)[[1]]
+  rev_matches <- gregexpr("(?=CC.)", genome_seq, perl = TRUE)[[1]]
+  
+  cat("  Forward PAMs:", length(fwd_matches), "\n")
+  cat("  Reverse PAMs:", length(rev_matches), "\n")
+  
+  # Extract protospacers - forward strand
+  pam_data <- list()
+  
+  if (fwd_matches[1] != -1) {
+    valid_fwd <- fwd_matches[fwd_matches > 20]
+    if (length(valid_fwd) > 0) {
+      protos <- substring(genome_seq, valid_fwd - 20, valid_fwd - 1)
+      seeds <- substring(protos, 10, 20)
+      pam_data[[1]] <- data.table::data.table(
+        pam_position = valid_fwd, strand = "+", protospacer = protos, seed = seeds
+      )
+    }
+  }
+  
+  # Reverse strand
+  if (rev_matches[1] != -1) {
+    valid_rev <- rev_matches[rev_matches + 22 <= genome_length]
+    if (length(valid_rev) > 0) {
+      protos_fwd <- substring(genome_seq, valid_rev + 3, valid_rev + 22)
+      protos <- sapply(protos_fwd, reverse_complement, USE.NAMES = FALSE)
+      seeds <- substring(protos, 10, 20)
+      pam_data[[2]] <- data.table::data.table(
+        pam_position = valid_rev, strand = "-", protospacer = protos, seed = seeds
+      )
+    }
+  }
+  
+  pam_index <- data.table::rbindlist(pam_data)
+  
+  # Create DNAStringSet for FAST matching with Biostrings
+  cat("  Creating DNAStringSet for fast matching...\n")
+  proto_dna <- Biostrings::DNAStringSet(pam_index$protospacer)
+  
+  # Build seed hash for quick lookups
+  cat("  Building seed index...\n")
+  seed_index <- new.env(hash = TRUE)
+  for (i in seq_len(nrow(pam_index))) {
+    seed <- pam_index$seed[i]
+    pos <- pam_index$pam_position[i]
+    if (exists(seed, envir = seed_index)) {
+      seed_index[[seed]] <- c(seed_index[[seed]], pos)
+    } else {
+      seed_index[[seed]] <- pos
+    }
+  }
+  
+  cat("  Total PAM sites:", nrow(pam_index), "\n")
+  
+  list(
+    index = pam_index,
+    proto_dna = proto_dna,
+    seed_index = seed_index
+  )
+}
+
+#' FAST off-target counting using Biostrings
+#' Uses vcountPattern which is highly optimized C code
+count_off_targets_fast <- function(protospacer, pam_data, target_position) {
+  protospacer <- toupper(protospacer)
+  seed <- substr(protospacer, 10, 20)
+  
+  pam_index <- pam_data$index
+  seed_index <- pam_data$seed_index
+  proto_dna <- pam_data$proto_dna
+  
+  # Quick seed match check (hash lookup - O(1))
+  seed_matches <- 0
+  if (exists(seed, envir = seed_index)) {
+    matching_positions <- seed_index[[seed]]
+    seed_matches <- sum(matching_positions != target_position)
+  }
+  
+  # Use Biostrings for fast approximate matching
+  # vcountPattern counts matches with up to max.mismatch mismatches
+  query <- Biostrings::DNAString(protospacer)
+  
+  # Count matches with 1-4 mismatches (excluding exact matches)
+  # This is MUCH faster than R loops - uses optimized C code
+  off_target_count <- 0
+  
+  # We need to find sequences with 1-4 mismatches
+  # Strategy: count all with <=4 mismatches, subtract exact matches
+  matches_le4 <- Biostrings::vcountPattern(
+    query, proto_dna, 
+    max.mismatch = MAX_MISMATCHES, 
+    min.mismatch = 1,
+    with.indels = FALSE
+  )
+  
+  # Find which ones matched
+  match_indices <- which(matches_le4 > 0)
+  
+  # Exclude on-target
+  if (length(match_indices) > 0) {
+    on_target_idx <- which(pam_index$pam_position == target_position)
+    match_indices <- setdiff(match_indices, on_target_idx)
+    off_target_count <- length(match_indices)
+  }
+  
+  # Determine class
+  has_seed_matches <- seed_matches > 0
+  has_off_targets <- off_target_count > 0
+  
+  if (!has_seed_matches && !has_off_targets) {
+    off_target_class <- 1
+  } else if (!has_seed_matches && has_off_targets) {
+    off_target_class <- 2
+  } else if (has_seed_matches && !has_off_targets) {
+    off_target_class <- 3
+  } else {
+    off_target_class <- 4
+  }
+  
+  list(
+    seed_matches = seed_matches,
+    off_target_count = off_target_count,
+    off_target_class = off_target_class
+  )
+}
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+reverse_complement <- function(seq) {
+  complement <- chartr("ACGT", "TGCA", toupper(seq))
+  paste(rev(strsplit(complement, "")[[1]]), collapse = "")
+}
+
+translate_codon <- function(codon) {
+  codon <- toupper(codon)
+  if (codon %in% names(REVERSE_CODON_TABLE)) unname(REVERSE_CODON_TABLE[codon]) else NA
+}
+
+get_codons_for_aa <- function(aa) {
+  aa <- toupper(aa)
+  if (aa %in% names(CODON_TABLE)) CODON_TABLE[[aa]] else NULL
+}
+
+parse_mutation <- function(mutation_string) {
+  pattern <- "^([A-Za-z]+)([A-Z])([0-9]+)([A-Z])$"
+  match <- regmatches(mutation_string, regexec(pattern, mutation_string))[[1]]
+  
+  if (length(match) == 5) {
+    list(gene = match[2], wt_aa = match[3], position = as.integer(match[4]),
+         mut_aa = match[5], original_string = mutation_string)
+  } else NULL
+}
+
+calculate_cassette_score <- function(distance, off_target_class, num_substitutions = 5) {
+  base_scores <- c(5.0, 4.41, 3.9, 2.0)
+  distance_steps <- floor(min(distance, 30) / 3)
+  score <- base_scores[off_target_class] - (distance_steps * 0.2)
+  
+  max(score, 0)
+}
+
+generate_silent_pam_mutations <- function(gene_sequence, pam_position, strand, gene_start = 1,
+                                           codon_freq = ECOLI_CODON_FREQ) {
+  seq_chars <- strsplit(toupper(gene_sequence), "")[[1]]
+  mutations <- list()
+  
+  if (strand == "+") {
+    gg_positions <- c(pam_position + 1, pam_position + 2)
+    target_nts <- c("A", "C", "T")
+  } else {
+    gg_positions <- c(pam_position, pam_position + 1)
+    target_nts <- c("A", "G", "T")
+  }
+  
+  for (pos in gg_positions) {
+    if (pos < 1 || pos > length(seq_chars)) next
+    
+    codon_num <- ((pos - gene_start) %/% 3) + 1
+    codon_start <- (codon_num - 1) * 3 + gene_start
+    codon_pos <- ((pos - gene_start) %% 3) + 1
+    
+    if (codon_start < 1 || codon_start + 2 > length(seq_chars)) next
+    
+    original_codon <- paste(seq_chars[codon_start:(codon_start + 2)], collapse = "")
+    original_aa <- translate_codon(original_codon)
+    if (is.na(original_aa)) next
+    
+    for (new_nt in target_nts) {
+      if (new_nt == seq_chars[pos]) next
+      
+      new_codon_chars <- seq_chars[codon_start:(codon_start + 2)]
+      new_codon_chars[codon_pos] <- new_nt
+      new_codon <- paste(new_codon_chars, collapse = "")
+      new_aa <- translate_codon(new_codon)
+      
+      if (!is.na(new_aa) && new_aa == original_aa && new_aa != "*") {
+        
+        original_freq <- as.numeric(codon_freq[original_codon])
+        new_freq <- as.numeric(codon_freq[new_codon])
+        freq_diff <- abs(new_freq - original_freq)
+        
+        mutations[[length(mutations) + 1]] <- list(
+          position = pos, original_nt = seq_chars[pos], mutant_nt = new_nt,
+          original_codon = original_codon, mutant_codon = new_codon,
+          codon_change = paste(original_codon, "->", new_codon), amino_acid = original_aa,
+          original_freq = original_freq, new_freq = new_freq, freq_diff = freq_diff
+        )
+      }
+    }
+  }
+  # Sort by codon usage similarity (smallest freq_diff first)
+  if (length(mutations) > 1) {
+    freq_diffs <- sapply(mutations, `[[`, "freq_diff")
+    mutations <- mutations[order(freq_diffs)]
+  }
+  mutations
+}
+
+# ==============================================================================
+# COORDINATE HELPER
+# ==============================================================================
+
+#' Convert a gene-local position (within the coding sequence) to a genomic position
+#' 
+#' For plus-strand genes: genomic_pos = genomic_start + local_pos - 1
+#' For minus-strand genes: the coding sequence is the reverse complement of
+#'   the genomic region, so position 1 maps to genomic_end:
+#'   genomic_pos = genomic_end - local_pos + 1
+#'
+#' @param local_pos Position within the gene coding sequence (1-based)
+#' @param gene_genomic_start Genomic start coordinate (always the lower coordinate)
+#' @param gene_genomic_end Genomic end coordinate (always the higher coordinate)
+#' @param gene_strand "+" or "-"
+#' @return Genomic position on the + strand reference
+gene_local_to_genomic <- function(local_pos, gene_genomic_start, gene_genomic_end, gene_strand) {
+  if (gene_strand == "-") {
+    gene_genomic_end - local_pos -2 + 1
+  } else {
+    gene_genomic_start + local_pos - 1
+  }
+}
+
+# ==============================================================================
+# gRNA DESIGN - FAST VERSION (FIXED)
+# ==============================================================================
+
+#' Design gRNA candidates for a mutation
+#' 
+#' @param gene_sequence Gene coding sequence (already in correct reading frame;
+#'   for minus-strand genes this is the reverse complement of the genomic region)
+#' @param mutation Parsed mutation object
+#' @param gene_genomic_start Genomic start coordinate of the gene (lower coordinate)
+#' @param pam_data PAM index data from build_pam_index_fast()
+#' @param gene_genomic_end Genomic end coordinate of the gene (higher coordinate).
+#'   Required for correct off-target exclusion on minus-strand genes.
+#' @param gene_strand "+" or "-". Required for correct coordinate mapping.
+design_grna_for_mutation_fast <- function(gene_sequence, mutation, gene_genomic_start = 1,
+                                          pam_data = NULL, gene_genomic_end = NULL,
+                                          gene_strand = "+", codon_freq = ECOLI_CODON_FREQ) {
+  seq_upper <- toupper(gene_sequence)
+  gene_length_bp <- nchar(seq_upper)
+  gene_length_aa <- gene_length_bp %/% 3
+  
+  # If gene_genomic_end not provided, estimate it (works correctly for + strand)
+  if (is.null(gene_genomic_end)) {
+    gene_genomic_end <- gene_genomic_start + gene_length_bp - 1
+  }
+  
+  codon_start <- (mutation$position - 1) * 3 + 1
+  codon_end <- codon_start + 2
+  
+  if (mutation$position > gene_length_aa) {
+    warning("Position exceeds gene length")
+    return(list())
+  }
+  
+  original_codon <- substr(seq_upper, codon_start, codon_end)
+  mut_codons <- get_codons_for_aa(mutation$mut_aa)
+  if (is.null(mut_codons)) return(list())
+  
+  search_start <- max(1, codon_start - MAX_PAM_DISTANCE - 23)
+  search_end <- min(gene_length_bp, codon_end + MAX_PAM_DISTANCE + 3)
+  search_region <- substr(seq_upper, search_start, search_end)
+  
+  candidates <- list()
+  
+  # Forward PAMs (NGG in gene-local coordinates)
+  fwd_matches <- gregexpr("(?=.GG)", search_region, perl = TRUE)[[1]]
+  if (fwd_matches[1] != -1) {
+    for (rel_pos in fwd_matches) {
+      abs_pos <- search_start + rel_pos - 1
+      distance <- abs(abs_pos - codon_start)
+      
+      if (distance <= MAX_PAM_DISTANCE) {
+        proto_start <- abs_pos - 20
+        proto_end <- abs_pos - 1
+        
+        if (proto_start >= 1 && proto_end <= gene_length_bp) {
+          protospacer <- substr(seq_upper, proto_start, proto_end)
+          
+          if (nchar(protospacer) == 20) {
+            silent_pam_muts <- generate_silent_pam_mutations(seq_upper, abs_pos, "+", 1,
+                                                              codon_freq = codon_freq)
+            
+            if (length(silent_pam_muts) > 0) {
+              if (!is.null(pam_data)) {
+                # FIX: Use strand-aware coordinate conversion
+                target_genomic_pos <- gene_local_to_genomic(
+                  abs_pos, gene_genomic_start, gene_genomic_end, gene_strand
+                )
+                ot_result <- count_off_targets_fast(protospacer, pam_data, target_genomic_pos)
+              } else {
+                ot_result <- list(off_target_class = 1, seed_matches = 0, off_target_count = 0)
+              }
+              
+              # Only create ONE candidate per PAM (best codon + first silent mutation)
+              # This reduces candidates significantly
+              score <- calculate_cassette_score(distance, ot_result$off_target_class)
+              
+              if (score >= MIN_SCORE_THRESHOLD) {
+                candidates[[length(candidates) + 1]] <- list(
+                  protospacer = protospacer, pam_position = abs_pos, strand = "+",
+                  distance = distance, off_target_class = ot_result$off_target_class,
+                  seed_matches = ot_result$seed_matches, off_target_count = ot_result$off_target_count,
+                  score = score, original_codon = original_codon,
+                  mutant_codon = mut_codons[1], pam_mutation = silent_pam_muts[[1]],
+                  mutation_position = mutation$position, codon_start = codon_start
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  # Reverse PAMs (CCN in gene-local coordinates)
+  rev_matches <- gregexpr("(?=CC.)", search_region, perl = TRUE)[[1]]
+  if (rev_matches[1] != -1) {
+    for (rel_pos in rev_matches) {
+      abs_pos <- search_start + rel_pos - 1
+      distance <- abs(abs_pos - codon_start)
+      
+      if (distance <= MAX_PAM_DISTANCE) {
+        proto_start <- abs_pos + 3
+        proto_end <- abs_pos + 22
+        
+        if (proto_start >= 1 && proto_end <= gene_length_bp) {
+          protospacer <- reverse_complement(substr(seq_upper, proto_start, proto_end))
+          
+          if (nchar(protospacer) == 20) {
+            silent_pam_muts <- generate_silent_pam_mutations(seq_upper, abs_pos, "-", 1,
+                                                              codon_freq = codon_freq)
+            
+            if (length(silent_pam_muts) > 0) {
+              if (!is.null(pam_data)) {
+                # FIX: Use strand-aware coordinate conversion
+                target_genomic_pos <- gene_local_to_genomic(
+                  abs_pos, gene_genomic_start, gene_genomic_end, gene_strand
+                )
+                ot_result <- count_off_targets_fast(protospacer, pam_data, target_genomic_pos)
+              } else {
+                ot_result <- list(off_target_class = 1, seed_matches = 0, off_target_count = 0)
+              }
+              
+              score <- calculate_cassette_score(distance, ot_result$off_target_class)
+              
+              if (score >= MIN_SCORE_THRESHOLD) {
+                candidates[[length(candidates) + 1]] <- list(
+                  protospacer = protospacer, pam_position = abs_pos, strand = "-",
+                  distance = distance, off_target_class = ot_result$off_target_class,
+                  seed_matches = ot_result$seed_matches, off_target_count = ot_result$off_target_count,
+                  score = score, original_codon = original_codon,
+                  mutant_codon = mut_codons[1], pam_mutation = silent_pam_muts[[1]],
+                  mutation_position = mutation$position, codon_start = codon_start
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  # Sort by score
+  if (length(candidates) > 0) {
+    scores <- sapply(candidates, `[[`, "score")
+    candidates <- candidates[order(scores, decreasing = TRUE)]
+  }
+  
+  candidates
+}
+
+# ==============================================================================
+# OLIGO GENERATION
+# ==============================================================================
+
+generate_homology_arm <- function(gene_sequence, design, genome_seq = NULL,
+                                   gene_genomic_start = NULL, gene_strand = NULL) {
+  seq_chars <- strsplit(toupper(gene_sequence), "")[[1]]
+  gene_length <- length(seq_chars)
+  HOMOLOGY_ARM_LENGTH <- 85
+  
+  mut_seq_chars <- seq_chars
+  codon_start <- design$codon_start
+  codon_chars <- strsplit(design$mutant_codon, "")[[1]]
+  mut_seq_chars[codon_start:(codon_start + 2)] <- codon_chars
+  
+  pam_mut <- design$pam_mutation
+  mut_seq_chars[pam_mut$position] <- pam_mut$mutant_nt
+  
+  mut_positions <- c(codon_start, codon_start + 1, codon_start + 2, pam_mut$position)
+  edit_center <- round(mean(mut_positions))
+  
+  half_arm <- HOMOLOGY_ARM_LENGTH %/% 2
+  arm_start <- edit_center - half_arm
+  arm_end <- arm_start + HOMOLOGY_ARM_LENGTH - 1
+  
+  if (arm_start < 1) { arm_start <- 1; arm_end <- HOMOLOGY_ARM_LENGTH }
+  if (arm_end > gene_length) { arm_end <- gene_length; arm_start <- max(1, arm_end - HOMOLOGY_ARM_LENGTH + 1) }
+  
+  arm_seq <- paste(mut_seq_chars[arm_start:arm_end], collapse = "")
+  
+  list(sequence = arm_seq, start = arm_start, end = arm_end,
+       length = nchar(arm_seq), edit_center = edit_center)
+}
+
+generate_200bp_oligo <- function(design, homology_arm) {
+  oligo_sequence <- paste0(SPACER1, homology_arm$sequence, SPACER2,
+                           J23119_PROMOTER, design$protospacer, SGRNA_HANDLE)
+  list(oligo_sequence = oligo_sequence, length = nchar(oligo_sequence))
+}
+
+# ==============================================================================
+# MAIN LIBRARY DESIGN - WITH PARALLEL OPTION (FIXED)
+# ==============================================================================
+
+#' Design mutation library - FAST version
+#' @param mutations Vector of mutation strings
+#' @param system Initialized system
+#' @param top_n Number of designs per mutation
+#' @param n_cores Number of cores (NULL = sequential, which may be faster for small jobs)
+design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores = NULL) {
+  
+  gene_sequences <- system$gene_sequences
+  gene_metadata <- system$gene_metadata
+  pam_data <- system$pam_data
+  genome_seq <- system$genome_seq
+  codon_freq <- system$codon_freq %||% ECOLI_CODON_FREQ
+  
+  n_mutations <- length(mutations)
+  cat("\nProcessing", n_mutations, "mutations\n")
+  
+  # Worker function
+  process_one <- function(mut_str) {
+    mutation <- parse_mutation(mut_str)
+    if (is.null(mutation)) return(NULL)
+    
+    gene_seq <- gene_sequences[[mutation$gene]] %||% gene_sequences[[tolower(mutation$gene)]]
+    if (is.null(gene_seq)) return(NULL)
+    
+    gene_meta <- gene_metadata[[mutation$gene]] %||% gene_metadata[[tolower(mutation$gene)]]
+    gene_genomic_start <- if (!is.null(gene_meta)) gene_meta$genomic_start else 1
+    gene_genomic_end   <- if (!is.null(gene_meta)) gene_meta$genomic_end else NULL
+    gene_strand        <- if (!is.null(gene_meta)) gene_meta$strand else "+"
+    
+    # FIX: Pass gene_genomic_end and gene_strand for correct coordinate mapping
+    candidates <- tryCatch(
+      design_grna_for_mutation_fast(gene_seq, mutation, gene_genomic_start, pam_data,
+                                     gene_genomic_end = gene_genomic_end,
+                                     gene_strand = gene_strand,
+                                     codon_freq = codon_freq),
+      error = function(e) list()
+    )
+    
+    if (length(candidates) == 0) return(NULL)
+    
+    top_candidates <- head(candidates, top_n)
+    
+    results <- lapply(seq_along(top_candidates), function(i) {
+      design <- top_candidates[[i]]
+      homology_arm <- generate_homology_arm(gene_seq, design, genome_seq,
+                                             gene_meta$genomic_start, gene_meta$strand)
+      oligo <- generate_200bp_oligo(design, homology_arm)
+      
+      data.frame(
+        mutation = mut_str, gene = mutation$gene, position = mutation$position,
+        wt_aa = mutation$wt_aa, mut_aa = mutation$mut_aa, rank = i,
+        score = round(design$score, 3), off_target_class = design$off_target_class,
+        seed_matches = design$seed_matches, off_target_count = design$off_target_count,
+        pam_distance = design$distance, strand = design$strand,
+        protospacer = design$protospacer, original_codon = design$original_codon,
+        mutant_codon = design$mutant_codon, pam_mutation = design$pam_mutation$codon_change,
+        pam_mutation_freq_diff = design$pam_mutation$freq_diff,
+        homology_arm = homology_arm$sequence, oligo_200bp = oligo$oligo_sequence,
+        oligo_length = oligo$length, stringsAsFactors = FALSE
+      )
+    })
+    
+    do.call(rbind, results)
+  }
+  
+  start_time <- Sys.time()
+  
+  if (is.null(n_cores) || n_cores == 1) {
+    # Sequential with progress
+    results <- vector("list", n_mutations)
+    for (i in seq_len(n_mutations)) {
+      results[[i]] <- process_one(mutations[i])
+      if (i %% 100 == 0 || i == n_mutations) {
+        cat(sprintf("\r  Progress: %d/%d (%.1f%%)    ", i, n_mutations, 100*i/n_mutations))
+      }
+    }
+    cat("\n")
+  } else {
+    # Parallel using mclapply (Unix) or parLapply (Windows)
+    cat("Using", n_cores, "cores\n")
+    
+    if (.Platform$OS.type == "unix") {
+      results <- parallel::mclapply(mutations, process_one, mc.cores = n_cores)
+    } else {
+      cl <- parallel::makeCluster(n_cores)
+      parallel::clusterExport(cl, c("gene_sequences", "gene_metadata", "pam_data", 
+                                    "genome_seq", "top_n", "codon_freq"), envir = environment())
+      # Export all required functions
+      parallel::clusterExport(cl, c("parse_mutation", "design_grna_for_mutation_fast",
+                                    "generate_homology_arm", "generate_200bp_oligo",
+                                    "count_off_targets_fast", "generate_silent_pam_mutations",
+                                    "calculate_cassette_score", "get_codons_for_aa",
+                                    "translate_codon", "reverse_complement",
+                                    "gene_local_to_genomic",
+                                    "CODON_TABLE", "REVERSE_CODON_TABLE", "ECOLI_CODON_FREQ", "MAX_PAM_DISTANCE",
+                                    "MIN_SCORE_THRESHOLD", "MAX_MISMATCHES",
+                                    "SPACER1", "SPACER2", "J23119_PROMOTER", "SGRNA_HANDLE", "%||%"))
+      results <- parallel::parLapply(cl, mutations, process_one)
+      parallel::stopCluster(cl)
+    }
+  }
+  
+  elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+  
+  valid_results <- results[!sapply(results, is.null)]
+  
+  cat("\n--- Complete ---\n")
+  cat("Time:", round(elapsed, 1), "seconds\n")
+  cat("Successful:", length(valid_results), "/", n_mutations, "\n")
+  
+  if (length(valid_results) > 0) {
+    final_df <- do.call(rbind, valid_results)
+    cat("Total designs:", nrow(final_df), "\n")
+    return(final_df)
+  }
+  
+  data.frame()
+}
+
+# ==============================================================================
+# SYSTEM INITIALIZATION
+# ==============================================================================
+
+initialize_system_fast <- function(genome_file = NULL, force_download = FALSE) {
+  cat("\n=== Initializing System (Fast Version) ===\n\n")
+  
+  genome <- if (!is.null(genome_file)) {
+    Biostrings::readDNAStringSet(genome_file)
+  } else {
+    download_ecoli_genome(force_download)
+  }
+  
+  genome_seq <- as.character(genome[[1]])
+  cat("Genome length:", format(nchar(genome_seq), big.mark = ","), "bp\n")
+  
+  # Build fast PAM index
+  pam_data <- build_pam_index_fast(genome_seq)
+  
+  # Load annotations
+  annotations <- download_ecoli_annotations(force_download)
+  
+  gene_data <- if (!is.null(annotations)) {
+    extract_gene_sequences(genome, annotations)
+  } else {
+    list(sequences = list(), metadata = list())
+  }
+  
+  cat("Genes loaded:", length(gene_data$sequences), "\n")
+  
+  # Compute genome-specific codon usage
+  codon_freq <- if (length(gene_data$sequences) > 0) {
+    compute_codon_usage(gene_data$sequences)
+  } else {
+    ECOLI_CODON_FREQ
+  }
+  
+  cat("\nSystem ready!\n")
+  
+  list(
+    genome = genome,
+    genome_seq = genome_seq,
+    pam_data = pam_data,
+    gene_sequences = gene_data$sequences,
+    gene_metadata = gene_data$metadata,
+    codon_freq = codon_freq
+  )
+}
+
+# ==============================================================================
+# SILENT MUTATION CONTROL GENERATION
+# ==============================================================================
+
+#' Calculate GC content of a sequence
+calculate_gc_content <- function(seq) {
+  seq <- toupper(seq)
+  chars <- strsplit(seq, "")[[1]]
+  gc_count <- sum(chars %in% c("G", "C"))
+  gc_count / length(chars)
+}
+
+get_synonymous_changes <- function(codon, codon_freq = ECOLI_CODON_FREQ) {
+  codon <- toupper(codon)
+  aa <- translate_codon(codon)
+  if (is.na(aa) || aa == "*") return(NULL)
+  
+  synonymous_codons <- CODON_TABLE[[aa]]
+  synonymous_codons <- synonymous_codons[synonymous_codons != codon]
+  
+  if (length(synonymous_codons) == 0) return(NULL)
+  
+  original_freq <- codon_freq[codon]
+  new_freqs <- codon_freq[synonymous_codons]
+  
+  df <- data.frame(
+    original_codon = codon,
+    new_codon = synonymous_codons,
+    amino_acid = aa,
+    original_gc = calculate_gc_content(codon),
+    new_gc = sapply(synonymous_codons, calculate_gc_content),
+    original_freq = as.numeric(original_freq),
+    new_freq = as.numeric(new_freqs),
+    freq_diff = abs(as.numeric(new_freqs) - as.numeric(original_freq)),
+    stringsAsFactors = FALSE
+  )
+  
+  # Sort by smallest frequency difference first
+  df <- df[order(df$freq_diff), ]
+  df
+}
+
+#' Identify candidate silent mutation sites in a gene - FAST version
+#' Only samples a few codons per gene instead of checking every one
+identify_silent_mutation_sites_fast <- function(gene_name, gene_sequence, gene_metadata = NULL,
+                                                 pam_index = NULL, max_codons_per_gene = 5,
+                                                 codon_freq = ECOLI_CODON_FREQ,
+                                                 max_freq_diff = 0.10) {
+  seq_upper <- toupper(gene_sequence)
+  gene_length_bp <- nchar(seq_upper)
+  gene_length_aa <- gene_length_bp %/% 3
+  
+  if (gene_length_aa < 10) return(NULL)  # Skip very short genes
+  
+  # Sample a few evenly-spaced codons instead of checking all
+  # Avoid first and last 10 codons (start/stop region)
+  safe_start <- 11
+  safe_end <- gene_length_aa - 10
+  
+  if (safe_end <= safe_start) return(NULL)
+  
+  # Pick evenly spaced positions
+  sampled_positions <- unique(round(seq(safe_start, safe_end, length.out = max_codons_per_gene)))
+  
+  candidates <- list()
+  
+  for (aa_pos in sampled_positions) {
+    codon_start <- (aa_pos - 1) * 3 + 1
+    codon_end <- codon_start + 2
+    
+    if (codon_end > gene_length_bp) next
+    
+    codon <- substr(seq_upper, codon_start, codon_end)
+    syn_changes <- get_synonymous_changes(codon, codon_freq = codon_freq)
+    
+    if (is.null(syn_changes) || nrow(syn_changes) == 0) next
+    
+    # Filter by codon usage similarity
+    if (!is.null(max_freq_diff)) {
+      syn_changes <- syn_changes[syn_changes$freq_diff <= max_freq_diff, , drop = FALSE]
+      if (nrow(syn_changes) == 0) next
+    }
+    
+    # Take the most usage-similar synonymous change (already sorted by freq_diff)
+    syn_changes <- syn_changes[1, , drop = FALSE]    
+    # Calculate local GC content (±50bp window)
+    window_start <- max(1, codon_start - 50)
+    window_end <- min(gene_length_bp, codon_end + 50)
+    local_seq <- substr(seq_upper, window_start, window_end)
+    local_gc <- calculate_gc_content(local_seq)
+    
+    # Calculate genomic position
+    if (!is.null(gene_metadata)) {
+      if (gene_metadata$strand == "+") {
+        genomic_pos <- gene_metadata$genomic_start + codon_start - 1
+      } else {
+        genomic_pos <- gene_metadata$genomic_end - codon_end + 1
+      }
+    } else {
+      genomic_pos <- NA
+    }
+    
+    # Quick PAM check - just look in local sequence
+    search_start <- max(1, codon_start - MAX_PAM_DISTANCE - 3)
+    search_end <- min(gene_length_bp, codon_end + MAX_PAM_DISTANCE + 23)
+    search_region <- substr(seq_upper, search_start, search_end)
+    has_nearby_pam <- grepl(".GG", search_region) || grepl("CC.", search_region)
+    
+    if (!has_nearby_pam) next  # Skip if no PAM nearby
+    
+      candidates[[length(candidates) + 1]] <- data.frame(
+            gene = gene_name,
+            aa_position = aa_pos,
+            amino_acid = syn_changes$amino_acid[1],
+            original_codon = syn_changes$original_codon[1],
+            new_codon = syn_changes$new_codon[1],
+            codon_gc_change = syn_changes$new_gc[1] - syn_changes$original_gc[1],
+            local_gc = local_gc,
+            genomic_position = genomic_pos,
+            has_nearby_pam = TRUE,
+            original_codon_freq = syn_changes$original_freq[1],
+            new_codon_freq = syn_changes$new_freq[1],
+            codon_freq_diff = syn_changes$freq_diff[1],
+            stringsAsFactors = FALSE
+          )
+    }
+  
+  if (length(candidates) > 0) do.call(rbind, candidates) else NULL
+}
+
+#' Generate silent mutation controls uniformly distributed across the genome - FAST
+generate_silent_controls <- function(n_controls, system = NULL, gene_sequences = NULL,
+                                      gene_metadata = NULL, gc_bins = 5,
+                                      min_genes_apart = 5, seed = NULL,
+                                      prefer_high_score = TRUE,
+                                      codon_freq = ECOLI_CODON_FREQ,
+                                      max_freq_diff = 0.10) {
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  cat("\n=== Generating Silent Mutation Controls (Fast) ===\n\n")
+  
+  if (is.null(gene_sequences)) {
+    if (!is.null(system) && !is.null(system$gene_sequences)) {
+      gene_sequences <- system$gene_sequences
+    } else {
+      stop("Gene sequences required.")
+    }
+  }
+  
+  if (is.null(gene_metadata) && !is.null(system)) {
+    gene_metadata <- system$gene_metadata
+  }
+  
+  # Calculate how many codons to sample per gene
+  # We want ~3x more candidates than needed for good selection
+  n_genes <- length(gene_sequences)
+  codons_per_gene <- max(3, ceiling((n_controls * 3) / n_genes))
+  
+  cat("Sampling ~", codons_per_gene, "codons per gene from", n_genes, "genes...\n")
+  
+  all_candidates <- list()
+  gene_names <- names(gene_sequences)
+  
+  for (i in seq_along(gene_names)) {
+    gene_name <- gene_names[i]
+    gene_seq <- gene_sequences[[gene_name]]
+    gene_meta <- if (!is.null(gene_metadata)) gene_metadata[[gene_name]] else NULL
+    
+    candidates <- identify_silent_mutation_sites_fast(
+      gene_name = gene_name, gene_sequence = gene_seq,
+      gene_metadata = gene_meta, max_codons_per_gene = codons_per_gene,
+      codon_freq = codon_freq, max_freq_diff = max_freq_diff
+    )
+    
+    if (!is.null(candidates) && nrow(candidates) > 0) {
+      candidates$gene_index <- i
+      all_candidates[[length(all_candidates) + 1]] <- candidates
+    }
+    
+    if (i %% 1000 == 0) cat("  Processed", i, "/", n_genes, "genes\n")
+  }
+  
+  if (length(all_candidates) == 0) stop("No silent mutation candidates found")
+  
+  all_candidates_df <- do.call(rbind, all_candidates)
+  cat("Found", nrow(all_candidates_df), "candidate silent mutations\n")
+  
+  # All candidates already have nearby PAMs (filtered in identify function)
+  targetable <- all_candidates_df
+  
+  # Simple selection: sort by genomic position, pick evenly spaced
+  if (!all(is.na(targetable$genomic_position))) {
+    targetable <- targetable[!is.na(targetable$genomic_position), ]
+    targetable <- targetable[order(targetable$genomic_position), ]
+  }
+  
+  # Bin by GC for stratified sampling
+  targetable$gc_bin <- cut(targetable$local_gc, breaks = gc_bins, labels = FALSE, include.lowest = TRUE)
+  
+  # Simple stratified selection - pick from each GC bin
+  selected_indices <- c()
+  controls_per_bin <- ceiling(n_controls / gc_bins)
+  
+  for (gc in 1:gc_bins) {
+    gc_subset_idx <- which(targetable$gc_bin == gc)
+    if (length(gc_subset_idx) == 0) next
+    
+    # Evenly space within this bin
+    n_to_take <- min(controls_per_bin, length(gc_subset_idx))
+    step <- max(1, floor(length(gc_subset_idx) / n_to_take))
+    take_idx <- gc_subset_idx[seq(1, length(gc_subset_idx), by = step)[1:n_to_take]]
+    
+    selected_indices <- c(selected_indices, take_idx)
+    if (length(selected_indices) >= n_controls) break
+  }
+  
+  # If not enough, add random ones
+  if (length(selected_indices) < n_controls) {
+    remaining <- setdiff(1:nrow(targetable), selected_indices)
+    n_needed <- min(n_controls - length(selected_indices), length(remaining))
+    if (n_needed > 0) {
+      selected_indices <- c(selected_indices, sample(remaining, n_needed))
+    }
+  }
+  
+  selected <- targetable[selected_indices[1:min(n_controls, length(selected_indices))], ]
+  
+  # Generate mutation strings
+  mutation_strings <- paste0(selected$gene, selected$amino_acid, selected$aa_position, selected$amino_acid)
+  selected$mutation_string <- mutation_strings
+  selected$codon_change <- paste(selected$original_codon, "->", selected$new_codon)
+  
+  cat("\n--- Summary ---\n")
+  cat("Controls selected:", nrow(selected), "\n")
+  cat("Unique genes:", length(unique(selected$gene)), "\n")
+  cat("GC range:", round(min(selected$local_gc), 3), "-", round(max(selected$local_gc), 3), "\n")
+  if ("codon_freq_diff" %in% names(selected)) {
+    cat("Codon freq diff: mean =", round(mean(selected$codon_freq_diff), 3),
+        ", max =", round(max(selected$codon_freq_diff), 3), "\n")
+  }
+  list(mutations = mutation_strings, details = selected)
+}
+
+#' Design silent control oligos - FAST version (FIXED)
+#' Over-selects candidates to ensure the desired number of successful designs
+#' while maintaining uniform genomic distribution
+design_silent_control_library_fast <- function(n_controls, system, top_n = 3, seed = NULL, 
+                                                oversample_factor = 2.0,
+                                                codon_freq = ECOLI_CODON_FREQ,
+                                                max_freq_diff = 0.10, ...) {
+  
+  # Over-select to account for ~30-50% failure rate
+  n_to_select <- ceiling(n_controls * oversample_factor)
+  
+  cat("Targeting", n_controls, "successful controls, selecting", n_to_select, "candidates\n")
+  
+  controls <- generate_silent_controls(n_controls = n_to_select, system = system, seed = seed,
+                                        codon_freq = codon_freq, max_freq_diff = max_freq_diff, ...)
+  
+  cat("\n=== Designing gRNAs for Silent Controls ===\n\n")
+  
+  gene_sequences <- system$gene_sequences
+  gene_metadata <- system$gene_metadata
+  pam_data <- system$pam_data
+  genome_seq <- system$genome_seq
+  codon_freq <- system$codon_freq %||% ECOLI_CODON_FREQ
+  
+  # Process ALL candidates first, track which succeeded
+  all_results <- list()
+  success_flags <- logical(nrow(controls$details))
+  n_total <- nrow(controls$details)
+  
+  for (i in 1:n_total) {
+    ctrl <- controls$details[i, ]
+    
+    if (i %% 10 == 0 || i == n_total) {
+      cat(sprintf("\r  Processing: %d/%d candidates    ", i, n_total))
+    }
+    
+    gene_seq <- gene_sequences[[ctrl$gene]] %||% gene_sequences[[tolower(ctrl$gene)]]
+    if (is.null(gene_seq)) next
+    
+    gene_meta <- gene_metadata[[ctrl$gene]] %||% gene_metadata[[tolower(ctrl$gene)]]
+    gene_genomic_start <- if (!is.null(gene_meta)) gene_meta$genomic_start else 1
+    gene_genomic_end   <- if (!is.null(gene_meta)) gene_meta$genomic_end else NULL
+    gene_strand        <- if (!is.null(gene_meta)) gene_meta$strand else "+"
+    
+    mutation <- list(
+      gene = ctrl$gene,
+      wt_aa = ctrl$amino_acid,
+      position = ctrl$aa_position,
+      mut_aa = ctrl$amino_acid,
+      original_string = ctrl$mutation_string
+    )
+    
+    # FIX: Pass gene_genomic_end and gene_strand for correct coordinate mapping
+    candidates <- tryCatch(
+      design_grna_for_mutation_fast(gene_seq, mutation, gene_genomic_start, pam_data,
+                                     gene_genomic_end = gene_genomic_end,
+                                     gene_strand = gene_strand,
+                                     codon_freq = codon_freq),
+      error = function(e) list()
+    )
+    
+    if (length(candidates) == 0) next
+    
+    # Mark as successful
+    success_flags[i] <- TRUE
+    
+    # Override codon to the specified silent mutation
+    for (j in seq_along(candidates)) {
+      candidates[[j]]$mutant_codon <- ctrl$new_codon
+    }
+    
+    top_candidates <- head(candidates, top_n)
+    
+    for (k in seq_along(top_candidates)) {
+      design <- top_candidates[[k]]
+      
+      homology_arm <- generate_homology_arm(gene_seq, design, genome_seq,
+                                             gene_meta$genomic_start, gene_meta$strand)
+      oligo <- generate_200bp_oligo(design, homology_arm)
+      
+      result <- data.frame(
+        mutation = ctrl$mutation_string,
+        gene = ctrl$gene,
+        position = ctrl$aa_position,
+        wt_aa = ctrl$amino_acid,
+        mut_aa = ctrl$amino_acid,
+        is_silent_control = TRUE,
+        original_codon = ctrl$original_codon,
+        new_codon = ctrl$new_codon,
+        codon_change = ctrl$codon_change,
+        rank = k,
+        score = round(design$score, 3),
+        off_target_class = design$off_target_class,
+        seed_matches = design$seed_matches,
+        off_target_count = design$off_target_count,
+        pam_distance = design$distance,
+        strand = design$strand,
+        protospacer = design$protospacer,
+        pam_mutation = design$pam_mutation$codon_change,
+        pam_mutation_freq_diff = design$pam_mutation$freq_diff,
+        local_gc = ctrl$local_gc,
+        genomic_position = ctrl$genomic_position,
+        homology_arm = homology_arm$sequence,
+        oligo_200bp = oligo$oligo_sequence,
+        oligo_length = oligo$length,
+        stringsAsFactors = FALSE
+      )
+      
+      all_results[[length(all_results) + 1]] <- result
+    }
+  }
+  cat("\n")
+  
+  if (length(all_results) == 0) {
+    warning("No designs generated")
+    return(list(controls = controls, designs = data.frame()))
+  }
+  
+  designs_df <- do.call(rbind, all_results)
+  n_successful <- sum(success_flags)
+  
+  cat("\n  Successful designs:", n_successful, "/", n_total, "candidates\n")
+  
+  # Now select uniformly from successful ones
+  if (n_successful > n_controls) {
+    cat("  Selecting", n_controls, "uniformly distributed from", n_successful, "successful\n")
+    
+    # Get successful controls with their genomic positions
+    successful_indices <- which(success_flags)
+    successful_details <- controls$details[successful_indices, ]
+    
+    # Sort by genomic position and pick evenly spaced
+    if (!all(is.na(successful_details$genomic_position))) {
+      order_idx <- order(successful_details$genomic_position)
+      successful_details <- successful_details[order_idx, ]
+      successful_indices <- successful_indices[order_idx]
+    }
+    
+    # Pick evenly spaced indices to maintain uniform distribution
+    step <- n_successful / n_controls
+    keep_positions <- round(seq(1, n_successful, by = step))[1:n_controls]
+    keep_mutations <- successful_details$mutation_string[keep_positions]
+    
+    # Filter designs to only keep selected mutations
+    designs_df <- designs_df[designs_df$mutation %in% keep_mutations, ]
+    controls$details <- controls$details[controls$details$mutation_string %in% keep_mutations, ]
+    controls$mutations <- controls$details$mutation_string
+  } else if (n_successful < n_controls) {
+    warning("Only ", n_successful, " successful designs, fewer than requested ", n_controls)
+    # Keep all successful ones
+    successful_mutations <- controls$details$mutation_string[success_flags]
+    designs_df <- designs_df[designs_df$mutation %in% successful_mutations, ]
+    controls$details <- controls$details[success_flags, ]
+    controls$mutations <- controls$details$mutation_string
+  }
+  
+  cat("\n--- Design Summary ---\n")
+  cat("Total oligo designs:", nrow(designs_df), "\n")
+  cat("Successful controls:", length(unique(designs_df$mutation)), "/", n_controls, "requested\n")
+  
+  # Verify uniform distribution
+  if (!all(is.na(controls$details$genomic_position))) {
+    positions <- controls$details$genomic_position
+    cat("Genomic spread:", format(min(positions), big.mark=","), "-", 
+        format(max(positions), big.mark=","), "bp\n")
+  }
+  
+  list(controls = controls, designs = designs_df)
+}
+
+#' Generate report for silent controls
+generate_silent_control_report <- function(design_result) {
+  controls <- design_result$controls
+  designs <- design_result$designs
+  
+  cat("\n============================================================\n")
+  cat("SILENT CONTROL DESIGN REPORT\n")
+  cat("============================================================\n\n")
+  
+  cat("--- Control Selection ---\n")
+  cat("Total controls requested:", nrow(controls$details), "\n")
+  cat("Controls with oligo designs:", length(unique(designs$mutation)), "\n")
+  cat("Total oligo designs:", nrow(designs), "\n\n")
+  
+  cat("--- Genomic Distribution ---\n")
+  if (!all(is.na(controls$details$genomic_position))) {
+    positions <- controls$details$genomic_position
+    genome_size <- max(positions, na.rm = TRUE)
+    bin_breaks <- seq(0, genome_size, length.out = 11)
+    pos_bins <- cut(positions, breaks = bin_breaks, labels = FALSE)
+    
+    cat("Position distribution across genome (10 bins):\n")
+    bin_counts <- table(factor(pos_bins, levels = 1:10))
+    for (b in 1:10) {
+      bar <- paste(rep("#", bin_counts[b]), collapse = "")
+      cat(sprintf("  Bin %2d: %s (%d)\n", b, bar, bin_counts[b]))
+    }
+  }
+  
+  cat("\n--- GC Content Distribution ---\n")
+  gc_vals <- controls$details$local_gc
+  cat(sprintf("  Range: %.1f%% - %.1f%%\n", min(gc_vals)*100, max(gc_vals)*100))
+  cat(sprintf("  Mean:  %.1f%% (SD: %.1f%%)\n", mean(gc_vals)*100, sd(gc_vals)*100))
+  
+  cat("\n--- Codon Usage Similarity ---\n")
+  if ("codon_freq_diff" %in% names(controls$details)) {
+    fd <- controls$details$codon_freq_diff
+    cat(sprintf("  Frequency difference range: %.3f - %.3f\n", min(fd), max(fd)))
+    cat(sprintf("  Mean freq difference:       %.3f (SD: %.3f)\n", mean(fd), sd(fd)))
+    cat(sprintf("  Controls with freq_diff < 0.05: %d (%.1f%%)\n",
+                sum(fd < 0.05), 100 * sum(fd < 0.05) / length(fd)))
+    cat(sprintf("  Controls with freq_diff < 0.10: %d (%.1f%%)\n",
+                sum(fd < 0.10), 100 * sum(fd < 0.10) / length(fd)))
+  }
+  cat("\n--- gRNA Design Quality ---\n")
+  if (nrow(designs) > 0) {
+    cat("Score distribution:\n")
+    cat("  Min:", min(designs$score), "\n")
+    cat("  Max:", max(designs$score), "\n")
+    cat("  Mean:", round(mean(designs$score), 2), "\n")
+    
+    cat("\nOff-target class distribution:\n")
+    for (cls in 1:4) {
+      n <- sum(designs$off_target_class == cls)
+      pct <- round(100 * n / nrow(designs), 1)
+      cat("  Class", cls, ":", n, "(", pct, "%)\n")
+    }
+  }
+  
+  cat("\n--- Example Controls (first 10) ---\n")
+  for (i in 1:min(10, nrow(controls$details))) {
+    ctrl <- controls$details[i, ]
+    freq_info <- if ("codon_freq_diff" %in% names(ctrl)) sprintf(" dFreq=%.3f", ctrl$codon_freq_diff) else ""
+    cat(sprintf("  %s: %s%d (%s) GC=%.1f%%%s\n",
+                ctrl$gene, ctrl$amino_acid, ctrl$aa_position,
+                ctrl$codon_change, ctrl$local_gc * 100, freq_info))
+  }
+}
+
+# ==============================================================================
+# QUICK TEST
+# ==============================================================================
+
+test_speed <- function() {
+  cat("\n=== Speed Test ===\n")
+  
+  system <- initialize_system_fast()
+  
+  # Test with a few mutations
+  test_muts <- c("lrpS125D", "thrBF45A", "metAL60W")
+  
+  cat("\nTesting with", length(test_muts), "mutations...\n")
+  
+  time <- system.time({
+    results <- design_mutation_library_fast(test_muts, system, top_n = 3)
+  })
+  
+  cat("\nTime per mutation:", round(time["elapsed"] / length(test_muts), 2), "seconds\n")
+  cat("Estimated time for 13,000 mutations:", 
+      round(time["elapsed"] / length(test_muts) * 13000 / 60, 1), "minutes\n")
+  
+  results
+}
+```
+
+
+Run the speed test
+```{r}
+# First, run the speed test to see how fast it is
+test_results <- test_speed()
+
+# load the E. coli phosphosites
+phosphosites <- read.csv("W:/users/Kian/PhD/PTM_datasets/Phosphorylation/Datasets/Aggregated_phosphosite_datasets/Ecoli_phosphosites_all_STY_hq.csv")
+# Create a list of the changes
+phosphosite_mutations <- phosphosites%>%
+  filter(!is.na(Gene.Names..primary.))%>%
+  mutate(phospho_id = paste0(Gene.Names..primary., Phosphosite))%>%
+  group_by(phospho_id)%>%
+  mutate(phospho_in_E = paste0(phospho_id,'E'),
+         phospho_in_D = paste0(phospho_id,'D'),
+         phospho_out = ifelse(grepl('Y',phospho_id),paste0(phospho_id,'F'), paste0(phospho_id,'A')))%>%
+  ungroup()%>%
+  dplyr::select(Gene.Names..primary., phospho_in_E, phospho_in_D, phospho_out)%>%
+  tidyr::pivot_longer(!Gene.Names..primary.)
+
+# Then use for your full library:
+system <- initialize_system_fast()
+results_all <- design_mutation_library_fast(phosphosite_mutations$value, system, top_n = 3, n_cores = NULL)
+
+```
+
+```{r}
+# Take out the top oligo per mutation
+results_top <- results_all%>%
+  filter(rank == 1)
+
+results_top%>%
+  mutate(psite = paste0(gene, position))%>%
+  summarize(length(unique(psite)))
+
+results_top%>%
+  filter(score >= 3.0)%>%
+  mutate(psite = paste0(gene, position))%>%
+  summarize(length(unique(psite)))
+
+results_top_D <- results_top%>%filter(score >= 3.0 & mut_aa != 'D')
+
+
+
+write.csv(results_top,"W:/users/Kian/Collaborations/Jonas/Data Analysis/26032026_Oligos_debugged/generated_oligos_filter_2.5_D&E_CU_optimized.csv")
+write.csv(results_top%>%filter(score >= 3.0 & mut_aa != 'D'),"W:/users/Kian/Collaborations/Jonas/Data Analysis/26032026_Oligos_debugged/generated_oligos_filter_3_E_CU_optimized.csv")
+
+```
+```{r}
+# Initialize system (if not already done)
+system <- initialize_system_fast()
+
+silent_results <- design_silent_control_library_fast(
+  n_controls = 300,
+  system = system,
+  top_n = 3,
+  seed = 42,
+  oversample_factor = 2.0,
+  codon_freq = system$codon_freq,   
+  max_freq_diff = 0.01              
+)
+
+# Generate report
+generate_silent_control_report(silent_results)
+
+# Access results
+silent_results$designs           # The oligo designs
+silent_results$controls$details  # Details of selected controls
+
+# Pick chosen controls
+write.csv(silent_results$designs%>%
+  group_by(mutation)%>%
+  arrange(rank)%>%
+  slice_head(),
+  "W:/users/Kian/Collaborations/Jonas/Data Analysis/26032026_Oligos_debugged/generated_oligos_neutral_controls_CU_optimized.csv")
+```
+
