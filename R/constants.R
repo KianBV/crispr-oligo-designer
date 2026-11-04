@@ -128,9 +128,18 @@ HOMOLOGY_ARM_LENGTH <- 100
 GRNA_FWD_TAIL <- "gttttagagctagaaatagcaagt"
 GRNA_REV_TAIL <- "actagtattatacctaggactgag"
 
+# Golden Gate (BsaI) fusion overhangs. The annealed oligo pair is
+#   top: <top overhang> + protospacer ;  bottom: <bot overhang> + revcomp(protospacer)
+# Defaults TAGT/AAAC are the pEcgRNA promoter(...ACTAGT)/scaffold(GTTT...) fusion
+# sites, so the duplex ligates into a BsaI-linearised pEcgRNA. Vector-specific.
+GG_TOP_OVERHANG <- "TAGT"
+GG_BOT_OVERHANG <- "AAAC"
+
 # Oligo name suffixes
 GRNA_FWD_SUFFIX <- "_pEcgRNA_fw_gibson"
 GRNA_REV_SUFFIX <- "_pEcgRNA_rv_gibson"
+GG_TOP_SUFFIX   <- "_gg_bsaI_top"
+GG_BOT_SUFFIX   <- "_gg_bsaI_bot"
 HA_SUFFIX       <- "_HA"
 
 # Phosphorothioate (PTO) protection on the homology arm oligo

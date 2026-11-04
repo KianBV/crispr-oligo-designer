@@ -33,6 +33,10 @@ microsynth:
   template_path: "templates/MicrosynthUploadFormDNA__2_.xlsx"
   sheet: "DNA Order"
 
+  # Which gRNA cloning oligos to emit: "gibson", "golden_gate" or "both".
+  cloning_method: "gibson"
+
+  # --- Gibson primers ---
   # gRNA Gibson-assembly primer 3' homology tails. Each primer is
   #   <protospacer or its reverse complement> + <tail>
   # (tail appended at the 3' end). Tails are lowercase by convention so the
@@ -40,9 +44,20 @@ microsynth:
   fwd_tail: "gttttagagctagaaatagcaagt"   # first 24 nt of the sgRNA scaffold
   rev_tail: "actagtattatacctaggactgag"   # revcomp of the J23119 promoter 3' end
 
+  # --- Golden Gate (BsaI) annealed oligo pair ---
+  # top:  <gg_top_overhang> + protospacer ;  bottom: <gg_bot_overhang> + revcomp
+  # Defaults TAGT/AAAC are the pEcgRNA promoter/scaffold fusion sites. These are
+  # VECTOR-SPECIFIC -- set them to the 4-nt overhangs your BsaI vector produces.
+  gg_top_overhang: "TAGT"
+  gg_bot_overhang: "AAAC"
+  gg_phosphorylate: false         # order GG oligos 5'-phosphorylated for ligation
+  gg_phos_label: "Phosphate"      # exact Microsynth 5'-modification dropdown term
+
   # Oligo name suffixes.
   fwd_name_suffix: "_pEcgRNA_fw_gibson"
   rev_name_suffix: "_pEcgRNA_rv_gibson"
+  gg_top_name_suffix: "_gg_bsaI_top"
+  gg_bot_name_suffix: "_gg_bsaI_bot"
   ha_name_suffix: "_HA"
 
   # Number of 5' bases protected by phosphorothioate (PTO) bonds on the
@@ -55,6 +70,21 @@ microsynth:
   condition: "Dried"
   datasheet: "Standard"
   aliquots: "No"
+
+qc:
+  # Oligo quality control (shown in the app's QC tab; thresholds drive the flags).
+  enabled: true
+  na_mM: 50               # monovalent cation conc for Tm (fold Mg2+ in here)
+  oligo_uM: 0.5           # strand concentration for Tm
+  gc_min: 0.30            # flag GC below this fraction
+  gc_max: 0.65            # flag GC above this fraction
+  tm_min: 50              # flag primer Tm below this (deg C)
+  tm_max: 75              # flag primer Tm above this (deg C)
+  max_homopolymer: 5      # flag single-base runs >= this length
+  hairpin_stem: 6         # flag self-complementary stems >= this many bp
+  hairpin_min_loop: 3     # minimum hairpin loop size considered
+  dimer3: 4               # flag 3' self-dimer >= this many bp
+  enzymes: ["BsaI", "BbsI"]   # internal recognition sites to check for
 
 export:
   # Default minimum score used when selecting top-ranked designs for the order form.

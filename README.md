@@ -145,27 +145,60 @@ Recognised identifier types (extracted from the GFF/GTF when present):
 | `generated_oligos_top_<date>.csv` | The top-ranked design per mutation, after the score/amino-acid filters. |
 | `oligo_list_<date>.csv` | The flat oligo list (name + sequence) that goes into the order form. |
 | `MicrosynthOrder_filled_<date>.xlsx` | The filled Microsynth order form. |
+| `oligo_qc_<date>.csv` | Per-oligo QC (GC, Tm, hairpin, dimer, enzyme sites, flags). |
 | `run_summary_<date>.txt` | Human-readable summary of the run. |
 
-Each top-ranked mutation yields three oligos:
+### gRNA cloning oligos
 
-- `<mutation>_pEcgRNA_fw_gibson` — protospacer + 24-nt 3′ homology tail
-  (`gttttagagctagaaatagcaagt`, the start of the sgRNA scaffold)
-- `<mutation>_pEcgRNA_rv_gibson` — reverse-complement of the protospacer +
-  24-nt 3′ homology tail (`actagtattatacctaggactgag`, the reverse complement of
-  the J23119 promoter 3′ end)
-- `<mutation>_HA` — the homology-arm repair oligo with phosphorothioate (PTO)
-  bonds on the first 4 bases (`X*X*X*X…`)
+Each mutation always yields the repair donor **`<mutation>_HA`** — the homology-arm
+oligo with phosphorothioate (PTO) bonds on the first 4 bases (`X*X*X*X…`). The
+**spacer** is delivered by one of two cloning methods
+(`microsynth.cloning_method` = `gibson` | `golden_gate` | `both`):
 
-The two gRNA primers are **Gibson-assembly primers** for the pEcgRNA vector.
-Example (spacer `GAACGTTGTGGATGTCCAGC`):
+**Gibson** — whole-plasmid PCR primers for the pEcgRNA vector:
+
+- `<mutation>_pEcgRNA_fw_gibson` — protospacer + 24-nt 3′ tail (`gttttagagctagaaatagcaagt`, sgRNA scaffold start)
+- `<mutation>_pEcgRNA_rv_gibson` — revcomp(protospacer) + 24-nt 3′ tail (`actagtattatacctaggactgag`, revcomp of J23119 3′ end)
 
 ```
 _pEcgRNA_fw_gibson : GAACGTTGTGGATGTCCAGCgttttagagctagaaatagcaagt
 _pEcgRNA_rv_gibson : GCTGGACATCCACAACGTTCactagtattatacctaggactgag
 ```
 
+**Golden Gate (BsaI)** — an annealed oligo pair with 4-nt fusion overhangs,
+ligated into a BsaI-linearised vector (defaults `TAGT`/`AAAC` = pEcgRNA
+promoter/scaffold junctions; **set these to your vector's overhangs**):
+
+- `<mutation>_gg_bsaI_top` — `TAGT` + protospacer
+- `<mutation>_gg_bsaI_bot` — `AAAC` + revcomp(protospacer)
+
+```
+_gg_bsaI_top : TAGTGAACGTTGTGGATGTCCAGC
+_gg_bsaI_bot : AAACGCTGGACATCCACAACGTTC
+```
+
+The Golden Gate oligos can be ordered 5′-phosphorylated (`gg_phosphorylate: true`)
+for ligation. A spacer containing an internal **BsaI** site (`GGTCTC`/`GAGACC`)
+cannot be cloned by Golden Gate — the QC tab flags this.
+
 Oligos are deduplicated by sequence (first occurrence's name is kept).
+
+### Oligo QC
+
+The **QC tab** (and `oligo_qc_<date>.csv`) reports, per oligo:
+
+| Metric | Notes |
+|--------|-------|
+| GC % | flags <30% / >65% |
+| Tm (°C) | nearest-neighbor (SantaLucia); flags apply to **primers**, not the donor |
+| Hairpin stem (bp) | longest self-complementary stem — heuristic, not ΔG |
+| 3′ self-dimer (bp) | 3′-anchored self-complementarity (primers) |
+| Max homopolymer | longest single-base run |
+| BsaI / BbsI site | internal type-IIS site (breaks Golden Gate) |
+
+Flagged oligos are highlighted. All thresholds live in `config/config.yml → qc`.
+Values are dependency-free heuristics; for true thermodynamic ΔG, wire in
+primer3/ViennaRNA (a hook is noted in `R/qc.R`).
 
 ---
 
@@ -184,7 +217,13 @@ session). Key parameters:
 | `design.n_cores` | 1 | CPU cores (>1 = parallel). |
 | `export.min_score_filter` | 3.0 | Min score when selecting top-ranked designs for the order form. |
 | `microsynth.template_path` | `templates/MicrosynthUploadFormDNA__2_.xlsx` | Order-form template. |
+| `microsynth.cloning_method` | `gibson` | gRNA cloning oligos: `gibson` / `golden_gate` / `both`. |
 | `microsynth.fwd_tail` / `rev_tail` | `gttttagagctagaaatagcaagt` / `actagtattatacctaggactgag` | 24-nt 3′ Gibson homology tails appended to the gRNA primers. |
+| `microsynth.gg_top_overhang` / `gg_bot_overhang` | `TAGT` / `AAAC` | Golden Gate BsaI 4-nt fusion overhangs (**vector-specific**). |
+| `microsynth.gg_phosphorylate` | `false` | Order Golden Gate oligos 5′-phosphorylated. |
+| `qc.na_mM` / `oligo_uM` | 50 / 0.5 | Salt & strand conc for the nearest-neighbor Tm. |
+| `qc.gc_min`/`gc_max`, `tm_min`/`tm_max`, `hairpin_stem`, `dimer3`, `max_homopolymer` | — | QC flag thresholds. |
+| `qc.enzymes` | `[BsaI, BbsI]` | Internal restriction sites checked per oligo. |
 | `microsynth.pto_n_bases` | 4 | 5′ PTO-protected bases on the homology arm. |
 | `microsynth.purification/scale/condition/datasheet/aliquots` | `DES` / `0.04` / `Dried` / `Standard` / `No` | Order-form column defaults. |
 | `genome.default_strain` | `BW25113 …` | Strain selected by default in the app. |
@@ -211,7 +250,8 @@ session). Key parameters:
 │   ├── genome.R          #   genome/annotation download, caching, gene extraction
 │   ├── offtarget.R       #   PAM index + fast off-target counting (Biostrings)
 │   ├── design.R          #   gRNA design, homology arm, oligo assembly, library design
-│   ├── microsynth.R      #   oligo order generation + Microsynth form filling
+│   ├── microsynth.R      #   oligo order generation (Gibson + Golden Gate) + form filling
+│   ├── qc.R              #   oligo QC: Tm, GC, hairpin, dimer, enzyme sites
 │   └── pipeline.R        #   input reading, validation, orchestration, summaries
 ├── templates/            # Put the Microsynth .xlsx template here
 ├── examples/             # Example input files

@@ -27,11 +27,20 @@ default_config <- function() {
     microsynth = list(
       template_path   = "templates/MicrosynthUploadFormDNA__2_.xlsx",
       sheet           = "DNA Order",
+      # Which gRNA cloning oligos to emit: "gibson", "golden_gate" or "both".
+      cloning_method  = "gibson",
       # gRNA Gibson primer 3' homology tails (appended after the protospacer)
       fwd_tail        = "gttttagagctagaaatagcaagt",
       rev_tail        = "actagtattatacctaggactgag",
       fwd_name_suffix = "_pEcgRNA_fw_gibson",
       rev_name_suffix = "_pEcgRNA_rv_gibson",
+      # Golden Gate (BsaI) 4-nt fusion overhangs + 5'-phosphate option
+      gg_top_overhang = "TAGT",
+      gg_bot_overhang = "AAAC",
+      gg_top_name_suffix = "_gg_bsaI_top",
+      gg_bot_name_suffix = "_gg_bsaI_bot",
+      gg_phosphorylate   = FALSE,
+      gg_phos_label      = "Phosphate",   # exact Microsynth 5'-mod dropdown term
       ha_name_suffix  = "_HA",
       pto_n_bases     = 4,
       purification  = "DES",
@@ -39,6 +48,20 @@ default_config <- function() {
       condition     = "Dried",
       datasheet     = "Standard",
       aliquots      = "No"
+    ),
+    qc = list(
+      enabled         = TRUE,
+      na_mM           = 50,     # monovalent cation conc for Tm (fold Mg2+ in here)
+      oligo_uM        = 0.5,    # strand conc for Tm
+      gc_min          = 0.30,
+      gc_max          = 0.65,
+      tm_min          = 50,
+      tm_max          = 75,
+      max_homopolymer = 5,
+      hairpin_stem    = 6,      # flag hairpin stems >= this many bp
+      hairpin_min_loop = 3,
+      dimer3          = 4,      # flag 3' self-dimer >= this many bp
+      enzymes         = c("BsaI", "BbsI")
     ),
     export = list(
       min_score_filter = 3.0       # default score cut-off for the order form
@@ -97,6 +120,10 @@ apply_design_config <- function(cfg) {
   assign("GRNA_REV_TAIL",   as.character(m$rev_tail),        envir = .GlobalEnv)
   assign("GRNA_FWD_SUFFIX", as.character(m$fwd_name_suffix), envir = .GlobalEnv)
   assign("GRNA_REV_SUFFIX", as.character(m$rev_name_suffix), envir = .GlobalEnv)
+  assign("GG_TOP_OVERHANG", as.character(m$gg_top_overhang %||% "TAGT"), envir = .GlobalEnv)
+  assign("GG_BOT_OVERHANG", as.character(m$gg_bot_overhang %||% "AAAC"), envir = .GlobalEnv)
+  assign("GG_TOP_SUFFIX",   as.character(m$gg_top_name_suffix %||% "_gg_bsaI_top"), envir = .GlobalEnv)
+  assign("GG_BOT_SUFFIX",   as.character(m$gg_bot_name_suffix %||% "_gg_bsaI_bot"), envir = .GlobalEnv)
   assign("HA_SUFFIX",       as.character(m$ha_name_suffix),  envir = .GlobalEnv)
   assign("PTO_N_BASES",     as.numeric(m$pto_n_bases),       envir = .GlobalEnv)
 

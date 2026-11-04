@@ -8,7 +8,7 @@
 
 # --- Load backend modules (order matters for top-level definitions) -----------
 .backend_files <- c("packages.R", "constants.R", "config.R", "genome.R",
-                    "offtarget.R", "design.R", "microsynth.R", "pipeline.R")
+                    "offtarget.R", "design.R", "microsynth.R", "qc.R", "pipeline.R")
 for (.f in .backend_files) source(file.path("R", .f))
 
 load_gui_packages()
@@ -110,10 +110,33 @@ ui <- bslib::page_sidebar(
                          value = ""),
         shiny::numericInput("pto_n_bases", "PTO-protected 5' bases (homology arm)",
                             value = CFG0$microsynth$pto_n_bases, min = 0, max = 10, step = 1),
-        shiny::textInput("fwd_tail", "Forward gRNA primer 3' tail (Gibson)",
-                         value = CFG0$microsynth$fwd_tail),
-        shiny::textInput("rev_tail", "Reverse gRNA primer 3' tail (Gibson)",
-                         value = CFG0$microsynth$rev_tail),
+        shiny::hr(),
+        shiny::strong("gRNA cloning oligos"),
+        shiny::radioButtons("cloning_method", "Cloning method",
+                            choices = c("Gibson (whole-plasmid PCR)" = "gibson",
+                                        "Golden Gate (BsaI, annealed pair)" = "golden_gate",
+                                        "Both" = "both"),
+                            selected = CFG0$microsynth$cloning_method),
+        shiny::conditionalPanel(
+          condition = "input.cloning_method == 'gibson' || input.cloning_method == 'both'",
+          shiny::textInput("fwd_tail", "Gibson forward 3' tail",
+                           value = CFG0$microsynth$fwd_tail),
+          shiny::textInput("rev_tail", "Gibson reverse 3' tail",
+                           value = CFG0$microsynth$rev_tail)
+        ),
+        shiny::conditionalPanel(
+          condition = "input.cloning_method == 'golden_gate' || input.cloning_method == 'both'",
+          shiny::textInput("gg_top_overhang", "Golden Gate top overhang (4 nt)",
+                           value = CFG0$microsynth$gg_top_overhang),
+          shiny::textInput("gg_bot_overhang", "Golden Gate bottom overhang (4 nt)",
+                           value = CFG0$microsynth$gg_bot_overhang),
+          shiny::checkboxInput("gg_phosphorylate", "Order Golden Gate oligos 5'-phosphorylated",
+                               value = isTRUE(CFG0$microsynth$gg_phosphorylate))
+        ),
+        shiny::hr(),
+        shiny::strong("QC (Tm / GC / hairpins)"),
+        shiny::numericInput("qc_na_mM", "Monovalent cation for Tm (mM)",
+                            value = CFG0$qc$na_mM, min = 1, max = 1000, step = 1),
         shiny::fileInput("template_file", "Microsynth template (.xlsx) — optional override",
                          accept = ".xlsx")
       )
@@ -160,6 +183,18 @@ ui <- bslib::page_sidebar(
     ),
 
     bslib::nav_panel(
+      "QC", icon = shiny::icon("flask"),
+      shiny::uiOutput("qc_summary"),
+      shiny::div(class = "mb-2",
+        shiny::downloadButton("dl_qc", "Download QC CSV",
+                              class = "btn-outline-secondary btn-sm")),
+      shiny::p(shiny::tags$small(
+        "Tm = nearest-neighbor (SantaLucia). Hairpin/3'-dimer are heuristic stem ",
+        "lengths (bp), not thermodynamic ΔG. Flagged rows are highlighted.")),
+      DT::DTOutput("qc_table_out")
+    ),
+
+    bslib::nav_panel(
       "Summary", icon = shiny::icon("file-lines"),
       shiny::div(class = "mb-2",
         shiny::downloadButton("dl_summary", "Download summary (.txt)",
@@ -196,9 +231,14 @@ server <- function(input, output, session) {
     cfg$design$n_cores             <- input$n_cores
     cfg$export$min_score_filter    <- input$export_min_score
     cfg$microsynth$pto_n_bases     <- input$pto_n_bases
+    cfg$microsynth$cloning_method  <- input$cloning_method %||% CFG0$microsynth$cloning_method
     # Tails kept verbatim (lowercase convention marks the vector-homology region)
-    cfg$microsynth$fwd_tail        <- trimws(input$fwd_tail)
-    cfg$microsynth$rev_tail        <- trimws(input$rev_tail)
+    cfg$microsynth$fwd_tail        <- trimws(input$fwd_tail %||% CFG0$microsynth$fwd_tail)
+    cfg$microsynth$rev_tail        <- trimws(input$rev_tail %||% CFG0$microsynth$rev_tail)
+    cfg$microsynth$gg_top_overhang <- toupper(trimws(input$gg_top_overhang %||% CFG0$microsynth$gg_top_overhang))
+    cfg$microsynth$gg_bot_overhang <- toupper(trimws(input$gg_bot_overhang %||% CFG0$microsynth$gg_bot_overhang))
+    cfg$microsynth$gg_phosphorylate <- isTRUE(input$gg_phosphorylate)
+    cfg$qc$na_mM                   <- input$qc_na_mM %||% CFG0$qc$na_mM
     if (!is.null(input$template_file)) {
       cfg$microsynth$template_path <- input$template_file$datapath
     }
@@ -467,14 +507,15 @@ server <- function(input, output, session) {
   # ==== Order form ===========================================================
   oligo_orders <- shiny::reactive({
     shiny::req(rv$results_top)
+    build_oligo_orders(rv$results_top, effective_cfg())
+  })
+
+  # QC of the current oligo set
+  oligo_qc <- shiny::reactive({
+    shiny::req(rv$results_top)
     cfg <- effective_cfg()
-    generate_oligo_orders(rv$results_top,
-                          fwd_tail        = cfg$microsynth$fwd_tail,
-                          rev_tail        = cfg$microsynth$rev_tail,
-                          n_pto_bases     = cfg$microsynth$pto_n_bases,
-                          fwd_name_suffix = cfg$microsynth$fwd_name_suffix,
-                          rev_name_suffix = cfg$microsynth$rev_name_suffix,
-                          ha_name_suffix  = cfg$microsynth$ha_name_suffix)
+    qc_table(oligo_orders()$oligos, cfg$qc,
+             ha_suffix = cfg$microsynth$ha_name_suffix %||% "_HA")
   })
 
   output$order_summary <- shiny::renderUI({
@@ -519,6 +560,40 @@ server <- function(input, output, session) {
         }
       )
     }
+  )
+
+  # ==== QC ===================================================================
+  output$qc_summary <- shiny::renderUI({
+    if (is.null(rv$results_top) || nrow(rv$results_top) == 0)
+      return(shiny::p("Run the pipeline first — QC is computed on the ordered oligos."))
+    q <- oligo_qc()
+    n_flag <- sum(nzchar(q$flags))
+    bslib::layout_columns(
+      col_widths = c(3, 3, 3, 3),
+      bslib::value_box("Oligos", nrow(q), theme = "primary"),
+      bslib::value_box("Flagged", n_flag, theme = if (n_flag > 0) "warning" else "success"),
+      bslib::value_box("Hairpin ≥ thr",
+                       sum(q$hairpin_stem >= (effective_cfg()$qc$hairpin_stem %||% 6)),
+                       theme = "secondary"),
+      bslib::value_box("BsaI sites",
+                       if ("BsaI_site" %in% names(q)) sum(q$BsaI_site) else 0,
+                       theme = if (("BsaI_site" %in% names(q)) && any(q$BsaI_site)) "danger" else "success")
+    )
+  })
+
+  output$qc_table_out <- DT::renderDT({
+    q <- oligo_qc()
+    shiny::validate(shiny::need(nrow(q) > 0, "No oligos to QC."))
+    dt <- DT::datatable(q, filter = "top", rownames = FALSE,
+                        options = list(pageLength = 15, scrollX = TRUE))
+    # highlight flagged rows
+    DT::formatStyle(dt, "flags", target = "row",
+                    backgroundColor = DT::styleEqual("", "white", default = "#fff3cd"))
+  })
+
+  output$dl_qc <- shiny::downloadHandler(
+    filename = function() paste0("oligo_qc_", Sys.Date(), ".csv"),
+    content = function(file) utils::write.csv(oligo_qc(), file, row.names = FALSE)
   )
 
   # ==== Summary ==============================================================
@@ -576,7 +651,22 @@ server <- function(input, output, session) {
        <h4>Oligo size</h4>
        <p>The <b>Microsynth oligo size</b> (Settings) sets the homology-arm repair
           oligo length; default 100 bp. It is also configurable in
-          <code>config/config.yml</code>.</p>")
+          <code>config/config.yml</code>.</p>
+       <h4>Cloning method</h4>
+       <p>Under <b>Settings &rarr; gRNA cloning oligos</b> choose how the spacer is
+          delivered: <b>Gibson</b> (whole-plasmid PCR primers,
+          <code>_fw_gibson</code>/<code>_rv_gibson</code>), <b>Golden Gate</b> (an
+          annealed oligo pair <code>_gg_bsaI_top</code>/<code>_bot</code> with 4-nt
+          BsaI fusion overhangs, default <code>TAGT</code>/<code>AAAC</code>, optionally
+          5'-phosphorylated), or <b>Both</b>. The <code>_HA</code> repair donor is
+          always included.</p>
+       <h4>QC tab</h4>
+       <p>Every ordered oligo is checked for GC%, nearest-neighbor Tm, longest
+          hairpin stem, 3'-end self-dimer, homopolymer runs, and internal
+          <b>BsaI/BbsI</b> sites (a BsaI site in the spacer breaks Golden Gate
+          assembly). Flagged oligos are highlighted; thresholds are in
+          <code>config/config.yml &rarr; qc</code>. Hairpin/dimer values are heuristic
+          stem lengths, not thermodynamic &Delta;G.</p>")
   })
 }
 

@@ -147,19 +147,41 @@ select_top_ranked <- function(results_all, min_score = NULL, exclude_mut_aa = NU
 # Microsynth output
 # ------------------------------------------------------------------------------
 
+#' Build the oligo order table for the given top-ranked designs (no file I/O).
+#' Centralises the config -> generate_oligo_orders mapping so the GUI and the
+#' form writer stay in sync.
+build_oligo_orders <- function(results_top, cfg) {
+  m <- cfg$microsynth
+  generate_oligo_orders(
+    results_top,
+    method          = m$cloning_method  %||% "gibson",
+    fwd_tail        = m$fwd_tail        %||% GRNA_FWD_TAIL,
+    rev_tail        = m$rev_tail        %||% GRNA_REV_TAIL,
+    gg_top_overhang = m$gg_top_overhang %||% GG_TOP_OVERHANG,
+    gg_bot_overhang = m$gg_bot_overhang %||% GG_BOT_OVERHANG,
+    n_pto_bases     = m$pto_n_bases     %||% PTO_N_BASES,
+    fwd_name_suffix = m$fwd_name_suffix %||% GRNA_FWD_SUFFIX,
+    rev_name_suffix = m$rev_name_suffix %||% GRNA_REV_SUFFIX,
+    gg_top_name_suffix = m$gg_top_name_suffix %||% GG_TOP_SUFFIX,
+    gg_bot_name_suffix = m$gg_bot_name_suffix %||% GG_BOT_SUFFIX,
+    ha_name_suffix  = m$ha_name_suffix  %||% HA_SUFFIX,
+    gg_phosphorylate = isTRUE(m$gg_phosphorylate),
+    gg_phos_label   = m$gg_phos_label   %||% "Phosphate"
+  )
+}
+
+#' QC the oligos produced for the given designs. Returns a QC data.frame.
+qc_oligo_orders <- function(results_top, cfg) {
+  orders <- build_oligo_orders(results_top, cfg)
+  qc_table(orders$oligos, cfg$qc %||% list(),
+           ha_suffix = cfg$microsynth$ha_name_suffix %||% "_HA")
+}
+
 #' Generate the Microsynth order form for the given top-ranked designs.
 #' @return list with output_path and the dedup counts from generate_oligo_orders
 generate_microsynth_output <- function(results_top, cfg, output_path) {
   m <- cfg$microsynth
-  orders <- generate_oligo_orders(
-    results_top,
-    fwd_tail        = m$fwd_tail        %||% GRNA_FWD_TAIL,
-    rev_tail        = m$rev_tail        %||% GRNA_REV_TAIL,
-    n_pto_bases     = m$pto_n_bases     %||% PTO_N_BASES,
-    fwd_name_suffix = m$fwd_name_suffix %||% GRNA_FWD_SUFFIX,
-    rev_name_suffix = m$rev_name_suffix %||% GRNA_REV_SUFFIX,
-    ha_name_suffix  = m$ha_name_suffix  %||% HA_SUFFIX
-  )
+  orders <- build_oligo_orders(results_top, cfg)
 
   fill_microsynth_form(
     orders$oligos,
@@ -208,6 +230,7 @@ build_run_summary <- function(validation_df, results_all, results_top, cfg,
   add("Max PAM distance:          ", cfg$design$max_pam_distance, " bp")
   add("Min score threshold:       ", cfg$design$min_score_threshold)
   add("Designs per mutation:      ", cfg$design$top_n)
+  add("Cloning method:            ", cfg$microsynth$cloning_method %||% "gibson")
   add("")
   add("--- Results ---")
   n_designs <- if (!is.null(results_all)) nrow(results_all) else 0
