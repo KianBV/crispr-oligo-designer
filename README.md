@@ -33,9 +33,15 @@ terminal in the application folder:
 #    take several minutes the first time.
 Rscript install.R
 
-# 2. Launch the app (opens in your web browser).
+# 2. (Optional) accurate oligo QC — true hairpin/dimer ΔG via primer3.
+pip install primer3-py
+
+# 3. Launch the app (opens in your web browser).
 Rscript run.R
 ```
+
+`primer3-py` is optional: the app runs without it (QC falls back to built-in
+heuristics) and uses it automatically when present.
 
 If `Rscript` is not on your PATH, use the full path to it, e.g. on Windows:
 
@@ -191,14 +197,24 @@ The **QC tab** (and `oligo_qc_<date>.csv`) reports, per oligo:
 |--------|-------|
 | GC % | flags <30% / >65% |
 | Tm (°C) | nearest-neighbor (SantaLucia); flags apply to **primers**, not the donor |
-| Hairpin stem (bp) | longest self-complementary stem — heuristic, not ΔG |
-| 3′ self-dimer (bp) | 3′-anchored self-complementarity (primers) |
+| Hairpin ΔG / stem | most stable hairpin (kcal/mol with primer3, else stem bp) |
+| Self-dimer ΔG / 3′ | most stable self-dimer (kcal/mol with primer3, else 3′ bp) |
 | Max homopolymer | longest single-base run |
 | BsaI / BbsI site | internal type-IIS site (breaks Golden Gate) |
 
 Flagged oligos are highlighted. All thresholds live in `config/config.yml → qc`.
-Values are dependency-free heuristics; for true thermodynamic ΔG, wire in
-primer3/ViennaRNA (a hook is noted in `R/qc.R`).
+
+**Thermodynamic backend.** If `primer3-py` is installed, QC uses primer3's real
+nearest-neighbor thermodynamics — Tm, hairpin ΔG and self-dimer ΔG (kcal/mol) via
+`tools/primer3_calc.py`. Without it, QC falls back to dependency-free heuristics
+(nearest-neighbor Tm + stem-length hairpin/dimer). The QC tab shows which backend
+is live. To enable accurate ΔG:
+
+```bash
+pip install primer3-py      # needs Python on PATH
+```
+
+Set `qc.thermo_backend` to `auto` (default), `builtin`, or `off` in the config.
 
 ---
 
@@ -251,7 +267,8 @@ session). Key parameters:
 │   ├── offtarget.R       #   PAM index + fast off-target counting (Biostrings)
 │   ├── design.R          #   gRNA design, homology arm, oligo assembly, library design
 │   ├── microsynth.R      #   oligo order generation (Gibson + Golden Gate) + form filling
-│   ├── qc.R              #   oligo QC: Tm, GC, hairpin, dimer, enzyme sites
+│   ├── qc.R              #   oligo QC: Tm, GC, hairpin, dimer, enzyme sites (+primer3)
+├── tools/primer3_calc.py # optional primer3-py backend for accurate ΔG
 │   └── pipeline.R        #   input reading, validation, orchestration, summaries
 ├── templates/            # Put the Microsynth .xlsx template here
 ├── examples/             # Example input files

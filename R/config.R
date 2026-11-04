@@ -51,17 +51,27 @@ default_config <- function() {
     ),
     qc = list(
       enabled         = TRUE,
-      na_mM           = 50,     # monovalent cation conc for Tm (fold Mg2+ in here)
+      na_mM           = 50,     # monovalent cation conc for Tm
+      mg_mM           = 1.5,    # divalent (Mg2+) conc for primer3 thermodynamics
+      dntp_mM         = 0.6,    # dNTP conc for primer3 thermodynamics
       oligo_uM        = 0.5,    # strand conc for Tm
+      thermo_temp     = 37,     # temperature for hairpin/dimer folding (deg C)
       gc_min          = 0.30,
       gc_max          = 0.65,
       tm_min          = 50,
       tm_max          = 75,
       max_homopolymer = 5,
-      hairpin_stem    = 6,      # flag hairpin stems >= this many bp
+      hairpin_stem    = 6,      # heuristic: flag hairpin stems >= this many bp
       hairpin_min_loop = 3,
-      dimer3          = 4,      # flag 3' self-dimer >= this many bp
-      enzymes         = c("BsaI", "BbsI")
+      dimer3          = 4,      # heuristic: flag 3' self-dimer >= this many bp
+      hairpin_dg      = -3.0,   # primer3: flag hairpin dG <= this (kcal/mol)
+      dimer_dg        = -6.0,   # primer3: flag self-dimer dG <= this (kcal/mol)
+      enzymes         = c("BsaI", "BbsI"),
+      # Thermodynamic backend: "auto" uses primer3 (tools/primer3_calc.py) when
+      # available, else the built-in heuristics; "builtin"/"off" force heuristics.
+      thermo_backend  = "auto",
+      python          = "python",
+      primer3_script  = "tools/primer3_calc.py"
     ),
     export = list(
       min_score_filter = 3.0       # default score cut-off for the order form

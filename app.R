@@ -188,9 +188,7 @@ ui <- bslib::page_sidebar(
       shiny::div(class = "mb-2",
         shiny::downloadButton("dl_qc", "Download QC CSV",
                               class = "btn-outline-secondary btn-sm")),
-      shiny::p(shiny::tags$small(
-        "Tm = nearest-neighbor (SantaLucia). Hairpin/3'-dimer are heuristic stem ",
-        "lengths (bp), not thermodynamic ΔG. Flagged rows are highlighted.")),
+      shiny::uiOutput("qc_backend_note"),
       DT::DTOutput("qc_table_out")
     ),
 
@@ -581,6 +579,21 @@ server <- function(input, output, session) {
     )
   })
 
+  output$qc_backend_note <- shiny::renderUI({
+    q <- oligo_qc()
+    p3 <- "tm_method" %in% names(q) && any(q$tm_method == "primer3")
+    if (p3) {
+      shiny::p(shiny::tags$small(
+        shiny::icon("circle-check"), " Thermodynamics: ", shiny::strong("primer3"),
+        " — Tm, hairpin & self-dimer are true ΔG (kcal/mol)."))
+    } else {
+      shiny::p(shiny::tags$small(
+        shiny::icon("circle"), " Thermodynamics: ", shiny::strong("built-in heuristic"),
+        " (Tm = nearest-neighbor; hairpin/3'-dimer are stem lengths in bp, not ΔG). ",
+        "Run ", shiny::code("pip install primer3-py"), " for accurate ΔG."))
+    }
+  })
+
   output$qc_table_out <- DT::renderDT({
     q <- oligo_qc()
     shiny::validate(shiny::need(nrow(q) > 0, "No oligos to QC."))
@@ -665,8 +678,10 @@ server <- function(input, output, session) {
           hairpin stem, 3'-end self-dimer, homopolymer runs, and internal
           <b>BsaI/BbsI</b> sites (a BsaI site in the spacer breaks Golden Gate
           assembly). Flagged oligos are highlighted; thresholds are in
-          <code>config/config.yml &rarr; qc</code>. Hairpin/dimer values are heuristic
-          stem lengths, not thermodynamic &Delta;G.</p>")
+          <code>config/config.yml &rarr; qc</code>. With <code>primer3-py</code> installed
+          (<code>pip install primer3-py</code>) the hairpin/dimer values are true
+          thermodynamic &Delta;G; otherwise they are heuristic stem lengths. The QC tab
+          shows which backend is active.</p>")
   })
 }
 

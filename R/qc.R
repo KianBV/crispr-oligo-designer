@@ -137,6 +137,56 @@ has_enzyme_site <- function(seq, enzyme) {
 }
 
 # ==============================================================================
+# primer3 backend (optional, accurate thermodynamic Delta-G)
+# ==============================================================================
+# Shells out to tools/primer3_calc.py (primer3-py). Returns NULL on any failure
+# so callers transparently fall back to the built-in heuristics.
+
+.primer3_script <- function(qc_cfg = list()) {
+  qc_cfg$primer3_script %||% file.path("tools", "primer3_calc.py")
+}
+.primer3_python <- function(qc_cfg = list()) {
+  qc_cfg$python %||% "python"
+}
+
+#' Is the primer3 backend usable? Probes by running the helper on one sequence
+#' (avoids fragile cross-platform quoting of a `python -c` one-liner).
+primer3_available <- function(qc_cfg = list()) {
+  backend <- qc_cfg$thermo_backend %||% "auto"
+  if (identical(backend, "builtin") || identical(backend, "off")) return(FALSE)
+  if (!file.exists(.primer3_script(qc_cfg))) return(FALSE)
+  res <- tryCatch(primer3_run("GAACGTTGTGGATGTCCAGC", qc_cfg), error = function(e) NULL)
+  !is.null(res) && nrow(res) == 1 && !is.na(res$tm[1])
+}
+
+#' Run the primer3 batch over `seqs`. Returns a data.frame with columns
+#' tm, hp_dg, hp_tm, dimer_dg (one row per seq), or NULL on failure.
+primer3_run <- function(seqs, qc_cfg = list()) {
+  script <- .primer3_script(qc_cfg)
+  if (length(seqs) == 0 || !file.exists(script)) return(NULL)
+
+  seqfile <- tempfile(fileext = ".txt")
+  on.exit(unlink(seqfile), add = TRUE)
+  writeLines(gsub("[^ACGT]", "", toupper(seqs)), seqfile)
+
+  args <- c(script, seqfile,
+            qc_cfg$na_mM %||% 50, qc_cfg$mg_mM %||% 1.5, qc_cfg$dntp_mM %||% 0.6,
+            (qc_cfg$oligo_uM %||% 0.5) * 1000, qc_cfg$thermo_temp %||% 37)
+  out <- tryCatch(
+    suppressWarnings(system2(.primer3_python(qc_cfg), as.character(args),
+                             stdout = TRUE, stderr = FALSE)),
+    error = function(e) NULL
+  )
+  if (is.null(out) || length(out) < 2) return(NULL)
+  df <- tryCatch(utils::read.csv(text = paste(out, collapse = "\n"),
+                                 stringsAsFactors = FALSE),
+                 error = function(e) NULL)
+  if (is.null(df) || nrow(df) != length(seqs) ||
+      !all(c("tm", "hp_dg", "hp_tm", "dimer_dg") %in% names(df))) return(NULL)
+  df
+}
+
+# ==============================================================================
 # Per-oligo QC row + table
 # ==============================================================================
 
@@ -145,24 +195,34 @@ has_enzyme_site <- function(seq, enzyme) {
 #' @param role "primer" (Tm/dimer flags apply) or "donor" (ssDNA repair oligo:
 #'   Tm of a ~100-mer is inherently high and not meaningful, so those flags are
 #'   skipped; hairpin/GC/homopolymer still apply).
-qc_oligo <- function(name, seq, qc_cfg = list(), role = "primer") {
+#' @param thermo optional named list(tm, hp_dg, hp_tm, dimer_dg) from primer3. When
+#'   supplied, Tm and the hairpin/dimer flags use these accurate values instead of
+#'   the built-in heuristics.
+qc_oligo <- function(name, seq, qc_cfg = list(), role = "primer", thermo = NULL) {
   g   <- qc_cfg
   na  <- g$na_mM %||% 50
   oli <- g$oligo_uM %||% 0.5
   enzymes <- g$enzymes %||% c("BsaI", "BbsI")
+  use_p3 <- !is.null(thermo)
 
   clean <- gsub("[^ACGT]", "", toupper(seq))   # uppercase FIRST, then strip PTO '*'/mods
   len <- nchar(clean)
   gc  <- gc_fraction(clean)
-  tm  <- tm_nn(clean, na_mM = na, oligo_uM = oli)
   hp  <- longest_hairpin_stem(clean, min_loop = g$hairpin_min_loop %||% 3)
   d3  <- three_prime_dimer(clean, clean)
   hpz <- longest_homopolymer(clean)
 
+  tm        <- if (use_p3 && !is.na(thermo$tm)) round(thermo$tm, 1) else tm_nn(clean, na_mM = na, oligo_uM = oli)
+  tm_method <- if (use_p3) "primer3" else "NN"
+  hp_dg     <- if (use_p3) thermo$hp_dg else NA_real_
+  hp_tm     <- if (use_p3) thermo$hp_tm else NA_real_
+  dimer_dg  <- if (use_p3) thermo$dimer_dg else NA_real_
+
   row <- data.frame(
     oligo_name = name, role = role, length = len,
-    gc_pct = round(100 * gc, 1), tm = tm,
-    hairpin_stem = hp, self_dimer3 = d3, max_run = hpz,
+    gc_pct = round(100 * gc, 1), tm = tm, tm_method = tm_method,
+    hairpin_stem = hp, hairpin_dG = hp_dg, hairpin_tm = hp_tm,
+    self_dimer3 = d3, dimer_dG = dimer_dg, max_run = hpz,
     stringsAsFactors = FALSE
   )
   for (e in enzymes) row[[paste0(e, "_site")]] <- isTRUE(has_enzyme_site(clean, e))
@@ -172,12 +232,21 @@ qc_oligo <- function(name, seq, qc_cfg = list(), role = "primer") {
   gc_min <- g$gc_min %||% 0.30; gc_max <- g$gc_max %||% 0.65
   if (!is.na(gc) && gc < gc_min) flags <- c(flags, sprintf("low GC (%.0f%%)", 100 * gc))
   if (!is.na(gc) && gc > gc_max) flags <- c(flags, sprintf("high GC (%.0f%%)", 100 * gc))
-  if (identical(role, "primer")) {   # Tm / 3'-dimer only meaningful for primers
+  if (identical(role, "primer")) {   # Tm / dimer only meaningful for primers
     if (!is.na(tm) && !is.na(g$tm_min) && tm < g$tm_min) flags <- c(flags, sprintf("low Tm (%.0f)", tm))
     if (!is.na(tm) && !is.na(g$tm_max) && tm > g$tm_max) flags <- c(flags, sprintf("high Tm (%.0f)", tm))
-    if (d3 >= (g$dimer3 %||% 4))      flags <- c(flags, sprintf("3' self-dimer %dbp", d3))
+    if (use_p3) {
+      if (!is.na(dimer_dg) && dimer_dg <= (g$dimer_dg %||% -6)) flags <- c(flags, sprintf("self-dimer %.1f kcal/mol", dimer_dg))
+    } else if (d3 >= (g$dimer3 %||% 4)) {
+      flags <- c(flags, sprintf("3' self-dimer %dbp", d3))
+    }
   }
-  if (hp  >= (g$hairpin_stem %||% 6))  flags <- c(flags, sprintf("hairpin %dbp", hp))
+  # hairpin flag: prefer primer3 Delta-G, else heuristic stem length
+  if (use_p3) {
+    if (!is.na(hp_dg) && hp_dg <= (g$hairpin_dg %||% -3)) flags <- c(flags, sprintf("hairpin %.1f kcal/mol", hp_dg))
+  } else if (hp >= (g$hairpin_stem %||% 6)) {
+    flags <- c(flags, sprintf("hairpin %dbp", hp))
+  }
   if (hpz >= (g$max_homopolymer %||% 5)) flags <- c(flags, sprintf("%dx homopolymer", hpz))
   for (e in enzymes) if (isTRUE(row[[paste0(e, "_site")]])) flags <- c(flags, paste0(e, " site"))
 
@@ -187,14 +256,26 @@ qc_oligo <- function(name, seq, qc_cfg = list(), role = "primer") {
 
 #' QC every oligo in an order table (data.frame with oligo_name, sequence).
 #' Oligos whose name ends with `ha_suffix` are treated as donors (role = donor).
+#' When the primer3 backend is available it is batch-run once over all oligos and
+#' its accurate Tm / Delta-G values are used; otherwise the built-in heuristics are.
 qc_table <- function(oligo_table, qc_cfg = list(), ha_suffix = "_HA") {
   if (is.null(oligo_table) || nrow(oligo_table) == 0) {
     return(data.frame())
   }
+
+  # Accurate thermodynamics in one batch call (NULL -> heuristic fallback)
+  p3 <- NULL
+  backend <- qc_cfg$thermo_backend %||% "auto"
+  if (!backend %in% c("builtin", "off")) {
+    p3 <- tryCatch(primer3_run(oligo_table$sequence, qc_cfg), error = function(e) NULL)
+  }
+
   rows <- lapply(seq_len(nrow(oligo_table)), function(i) {
     nm <- oligo_table$oligo_name[i]
     role <- if (endsWith(nm, ha_suffix)) "donor" else "primer"
-    qc_oligo(nm, oligo_table$sequence[i], qc_cfg, role = role)
+    thermo <- if (!is.null(p3)) list(tm = p3$tm[i], hp_dg = p3$hp_dg[i],
+                                     hp_tm = p3$hp_tm[i], dimer_dg = p3$dimer_dg[i]) else NULL
+    qc_oligo(nm, oligo_table$sequence[i], qc_cfg, role = role, thermo = thermo)
   })
   do.call(rbind, rows)
 }
