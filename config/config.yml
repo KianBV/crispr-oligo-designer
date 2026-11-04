@@ -51,7 +51,7 @@ microsynth:
 
   # Default column values written into the order form.
   purification: "DES"
-  scale: "0.04"
+  scale: "GEN"
   condition: "Dried"
   datasheet: "Standard"
   aliquots: "No"
