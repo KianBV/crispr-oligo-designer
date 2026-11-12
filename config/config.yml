@@ -27,6 +27,24 @@ design:
   # CPU cores for the design run (1 = sequential; >1 uses parallel processing).
   n_cores: 1
 
+  # --- Scoring model (see SCORING.md) ---
+  # Defaults below reproduce the original behaviour exactly. Each optional term
+  # is OFF by default; turn one on to A/B it. (A candidate is kept only if its
+  # score >= min_score_threshold, so enabling penalties filters more strictly.)
+  scoring:
+    base_scores: [5.0, 4.41, 3.9, 2.0]   # by off-target class 1..4
+    swap_class_2_3: false                 # true -> rank class 3 (exact seed match) above class 2
+    distance_step_bp: 3
+    distance_penalty_per_step: 0.2
+    distance_cap_bp: 30
+    offtarget_count_weight: 0.0           # subtract w * ln(1 + off_targets + seed_matches); 0 = off
+    activity_term: false                  # subtract GC-band + homopolymer penalties
+    gc_ideal_min: 0.40
+    gc_ideal_max: 0.65
+    gc_penalty: 0.5
+    homopolymer_max: 4
+    homopolymer_penalty: 0.5
+
 microsynth:
   # Path to the official Microsynth order-form template (.xlsx).
   # Place the file in the templates/ folder and keep this path pointing at it.

@@ -46,10 +46,62 @@ parse_mutation <- function(mutation_string) {
   NULL
 }
 
-calculate_cassette_score <- function(distance, off_target_class, num_substitutions = 5) {
-  base_scores <- c(5.0, 4.41, 3.9, 2.0)
-  distance_steps <- floor(min(distance, 30) / 3)
-  score <- base_scores[off_target_class] - (distance_steps * 0.2)
+# On-target activity penalty: GC outside the ideal band + long homopolymer runs.
+# Self-contained (same GC/homopolymer logic as the QC module) so the core
+# pipeline has no cross-file dependency.
+activity_penalty <- function(protospacer, s = SCORING) {
+  seqU <- toupper(protospacer)
+  pen <- 0
+  chars <- strsplit(seqU, "")[[1]]
+  gc <- if (length(chars)) sum(chars %in% c("G", "C")) / length(chars) else NA_real_
+  if (!is.na(gc) && (gc < s$gc_ideal_min || gc > s$gc_ideal_max)) pen <- pen + s$gc_penalty
+  runs <- nchar(unlist(regmatches(seqU, gregexpr("(.)\\1*", seqU))))
+  hp <- if (length(runs)) max(runs) else 0L
+  if (hp > s$homopolymer_max) pen <- pen + s$homopolymer_penalty
+  pen
+}
+
+#' Cassette score for a gRNA candidate (see SCORING.md).
+#'
+#' score = base[class] - distance_penalty - offtarget_penalty - activity_penalty
+#'
+#' With SCORING_DEFAULTS this is exactly the original model
+#' (base[class] - 0.2*floor(min(distance,30)/3)); the magnitude and activity
+#' terms are off and class 2/3 are not swapped.
+#'
+#' @param distance PAM-to-edit distance (bp)
+#' @param off_target_class 1..4 from count_off_targets_fast()
+#' @param off_target_count number of <=4-mismatch off-targets (magnitude term)
+#' @param seed_matches number of exact-seed matches elsewhere (magnitude term)
+#' @param protospacer spacer sequence (activity term); NULL to skip
+#' @param scoring scoring config list (defaults to the global SCORING)
+calculate_cassette_score <- function(distance, off_target_class,
+                                     off_target_count = 0, seed_matches = 0,
+                                     protospacer = NULL, scoring = SCORING) {
+  s <- scoring %||% SCORING_DEFAULTS
+
+  # --- base score per off-target class (optionally swap class 2 <-> 3) ---
+  base <- s$base_scores
+  if (isTRUE(s$swap_class_2_3) && length(base) >= 3) {
+    tmp <- base[2]; base[2] <- base[3]; base[3] <- tmp
+  }
+  score <- base[off_target_class]
+
+  # --- distance penalty ---
+  steps <- floor(min(distance, s$distance_cap_bp) / s$distance_step_bp)
+  score <- score - steps * s$distance_penalty_per_step
+
+  # --- off-target magnitude penalty (log scale), 0 weight = off ---
+  w <- s$offtarget_count_weight %||% 0
+  if (w > 0) {
+    mag <- (off_target_count %||% 0) + (seed_matches %||% 0)
+    score <- score - w * log1p(mag)
+  }
+
+  # --- on-target activity penalty (GC + homopolymer) ---
+  if (isTRUE(s$activity_term) && !is.null(protospacer)) {
+    score <- score - activity_penalty(protospacer, s)
+  }
 
   max(score, 0)
 }
@@ -198,7 +250,10 @@ design_grna_for_mutation_fast <- function(gene_sequence, mutation, gene_genomic_
                 ot_result <- list(off_target_class = 1, seed_matches = 0, off_target_count = 0)
               }
 
-              score <- calculate_cassette_score(distance, ot_result$off_target_class)
+              score <- calculate_cassette_score(distance, ot_result$off_target_class,
+                                                   off_target_count = ot_result$off_target_count,
+                                                   seed_matches = ot_result$seed_matches,
+                                                   protospacer = protospacer)
 
               if (score >= MIN_SCORE_THRESHOLD) {
                 candidates[[length(candidates) + 1]] <- list(
@@ -245,7 +300,10 @@ design_grna_for_mutation_fast <- function(gene_sequence, mutation, gene_genomic_
                 ot_result <- list(off_target_class = 1, seed_matches = 0, off_target_count = 0)
               }
 
-              score <- calculate_cassette_score(distance, ot_result$off_target_class)
+              score <- calculate_cassette_score(distance, ot_result$off_target_class,
+                                                   off_target_count = ot_result$off_target_count,
+                                                   seed_matches = ot_result$seed_matches,
+                                                   protospacer = protospacer)
 
               if (score >= MIN_SCORE_THRESHOLD) {
                 candidates[[length(candidates) + 1]] <- list(
@@ -423,10 +481,11 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
                                     "design_grna_for_mutation_fast",
                                     "generate_homology_arm", "generate_200bp_oligo",
                                     "count_off_targets_fast", "generate_silent_pam_mutations",
-                                    "calculate_cassette_score", "get_codons_for_aa",
+                                    "calculate_cassette_score", "activity_penalty", "get_codons_for_aa",
                                     "translate_codon", "reverse_complement",
                                     "gene_local_to_genomic",
                                     "CODON_TABLE", "REVERSE_CODON_TABLE", "ECOLI_CODON_FREQ",
+                                    "SCORING", "SCORING_DEFAULTS",
                                     "MAX_PAM_DISTANCE", "HOMOLOGY_ARM_LENGTH",
                                     "MIN_SCORE_THRESHOLD", "MAX_MISMATCHES",
                                     "SPACER1", "SPACER2", "J23119_PROMOTER", "SGRNA_HANDLE", "%||%"),

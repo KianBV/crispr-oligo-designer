@@ -22,7 +22,8 @@ default_config <- function() {
       seed_length         = 11,
       max_mismatches      = 4,
       top_n               = 3,
-      n_cores             = 1
+      n_cores             = 1,
+      scoring             = SCORING_DEFAULTS   # see constants.R / SCORING.md
     ),
     microsynth = list(
       template_path   = "templates/MicrosynthUploadFormDNA__2_.xlsx",
@@ -125,6 +126,14 @@ apply_design_config <- function(cfg) {
   assign("SEED_LENGTH",         as.numeric(d$seed_length),         envir = .GlobalEnv)
   assign("MAX_MISMATCHES",      as.numeric(d$max_mismatches),      envir = .GlobalEnv)
   assign("HOMOLOGY_ARM_LENGTH", as.numeric(d$oligo_size),          envir = .GlobalEnv)
+
+  # Scoring model: merge any config overrides onto the defaults so partial
+  # `design.scoring` blocks in config.yml still work.
+  if (!is.null(d$scoring)) {
+    assign("SCORING", modifyList(SCORING_DEFAULTS, d$scoring), envir = .GlobalEnv)
+  } else {
+    assign("SCORING", SCORING_DEFAULTS, envir = .GlobalEnv)
+  }
 
   assign("GRNA_FWD_TAIL",   as.character(m$fwd_tail),        envir = .GlobalEnv)
   assign("GRNA_REV_TAIL",   as.character(m$rev_tail),        envir = .GlobalEnv)

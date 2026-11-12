@@ -229,6 +229,7 @@ session). Key parameters:
 | `design.oligo_size` | **100** | **Microsynth oligo size** — homology-arm (repair) oligo length in bp. Tunable. |
 | `design.max_pam_distance` | 30 | Max PAM-to-codon distance (bp). |
 | `design.min_score_threshold` | 3 | Minimum cassette score to keep a candidate. |
+| `design.scoring` | — | gRNA scoring model (class weights, distance/off-target/activity terms). See **[SCORING.md](SCORING.md)**. |
 | `design.top_n` | 3 | Ranked designs generated per mutation. |
 | `design.n_cores` | 1 | CPU cores (>1 = parallel). |
 | `export.min_score_filter` | 3.0 | Min score when selecting top-ranked designs for the order form. |

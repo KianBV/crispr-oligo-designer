@@ -114,6 +114,31 @@ MIN_SCORE_THRESHOLD <- 3    # minimum cassette score to keep a candidate
 SEED_LENGTH         <- 11   # seed length for off-target seed matching
 MAX_MISMATCHES      <- 4    # max mismatches counted as off-target
 
+# ------------------------------------------------------------------------------
+# Scoring model (see SCORING.md). The DEFAULTS below reproduce the original
+# behaviour exactly: score = base[class] - 0.2*floor(min(distance,30)/3), with
+# every optional term switched off. Override via config.yml -> design.scoring.
+# ------------------------------------------------------------------------------
+SCORING_DEFAULTS <- list(
+  # Base score per off-target class (1 = cleanest ... 4 = seed match + off-target)
+  base_scores               = c(5.0, 4.41, 3.9, 2.0),
+  swap_class_2_3            = FALSE,  # TRUE -> rank class 3 (exact seed match) above class 2
+  # Distance penalty: subtract `penalty_per_step` for each `step_bp` of PAM-to-edit distance
+  distance_step_bp          = 3,
+  distance_penalty_per_step = 0.2,
+  distance_cap_bp           = 30,
+  # Off-target magnitude penalty: weight * log1p(off_target_count + seed_matches). 0 = off.
+  offtarget_count_weight    = 0.0,
+  # On-target activity penalty (GC band + homopolymer runs). FALSE = off.
+  activity_term             = FALSE,
+  gc_ideal_min              = 0.40,
+  gc_ideal_max              = 0.65,
+  gc_penalty                = 0.5,
+  homopolymer_max           = 4,
+  homopolymer_penalty       = 0.5
+)
+SCORING <- SCORING_DEFAULTS   # live copy, overridden by apply_design_config()
+
 # Homology arm / repair oligo length.  This is the "Microsynth oligo size":
 # the length (bp) of the single-stranded repair template oligo that carries the
 # desired codon change + silent PAM mutation. Default 100 bp.

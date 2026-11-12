@@ -103,6 +103,18 @@ ui <- bslib::page_sidebar(
         shiny::numericInput("n_cores", "CPU cores",
                             value = CFG0$design$n_cores, min = 1, max = 16, step = 1),
         shiny::hr(),
+        shiny::strong("Scoring (A/B toggles)"),
+        shiny::p(shiny::tags$small("Off by default = original model. See SCORING.md.")),
+        shiny::checkboxInput("score_swap23",
+                             "Rank exact seed-match (class 3) above class 2",
+                             value = isTRUE(CFG0$design$scoring$swap_class_2_3)),
+        shiny::numericInput("score_ot_weight", "Off-target count penalty weight (0 = off)",
+                            value = CFG0$design$scoring$offtarget_count_weight,
+                            min = 0, max = 3, step = 0.1),
+        shiny::checkboxInput("score_activity",
+                             "On-target activity penalty (GC band + homopolymer)",
+                             value = isTRUE(CFG0$design$scoring$activity_term)),
+        shiny::hr(),
         shiny::strong("Order form (top-ranked)"),
         shiny::numericInput("export_min_score", "Min score for order form",
                             value = CFG0$export$min_score_filter, min = 0, max = 5, step = 0.1),
@@ -227,6 +239,11 @@ server <- function(input, output, session) {
     cfg$design$min_score_threshold <- input$min_score_threshold
     cfg$design$top_n               <- input$top_n
     cfg$design$n_cores             <- input$n_cores
+    cfg$design$scoring <- modifyList(CFG0$design$scoring %||% list(), list(
+      swap_class_2_3         = isTRUE(input$score_swap23),
+      offtarget_count_weight = input$score_ot_weight %||% 0,
+      activity_term          = isTRUE(input$score_activity)
+    ))
     cfg$export$min_score_filter    <- input$export_min_score
     cfg$microsynth$pto_n_bases     <- input$pto_n_bases
     cfg$microsynth$cloning_method  <- input$cloning_method %||% CFG0$microsynth$cloning_method
