@@ -220,9 +220,12 @@ offtarget_alignment_html <- function(guide, ot_row) {
     botc[i] <- cell(o[i], mm, "9px")
     midc[i] <- if (mm) "<span>&nbsp;</span>" else "<span style='color:#9fb6c7'>|</span>"
   }
+  # Fixed-width label column (flex) so both sequences start at the SAME x,
+  # regardless of label text width.
   row <- function(lead, cells) paste0(
-    "<div style='font-family:monospace;font-size:16px;letter-spacing:3px;white-space:nowrap;line-height:1.9'>",
-    "<span style='color:#888'>", lead, "</span>", paste(cells, collapse = ""), "</div>")
+    "<div style='display:flex;align-items:center;font-family:monospace;font-size:16px;line-height:2.0'>",
+    "<span style='flex:0 0 92px;color:#888;white-space:nowrap'>", lead, "</span>",
+    "<span style='letter-spacing:3px;white-space:nowrap'>", paste(cells, collapse = ""), "</span></div>")
 
   gene_lbl <- if (is.null(ot_row$gene) || is.na(ot_row$gene)) "intergenic" else paste0("<i>", ot_row$gene, "</i>")
   seedtag <- if (isTRUE(ot_row$seed_match)) " &middot; <span style='color:#C0392B'>seed match</span>" else ""
@@ -233,7 +236,7 @@ offtarget_alignment_html <- function(guide, ot_row) {
     ot_row$pam %||% "NGG", seedtag)
 
   paste0("<div class='mb-2 small'>", hdr, "</div>",
-         row("guide 5'-", topc), row("      ", midc), row("  OT  5'-", botc))
+         row("guide 5'-", topc), row("", midc), row("OT 5'-", botc))
 }
 
 # ==============================================================================
