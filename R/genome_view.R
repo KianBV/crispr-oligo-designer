@@ -118,8 +118,9 @@ render_design_ggmap <- function(design_row, system) {
   ha  <- toupper(design_row$homology_arm)
   edited_base <- function(p) if (p >= haS && p <= haE) substr(ha, p - haS + 1L, p - haS + 1L) else substr(gene, p, p)
 
-  from <- max(1L, min(ps, cs, pamS) - 3L)
-  to   <- min(glen, max(pe, cs + 2L, pamE) + 3L)
+  # Window covers the whole HA (donor) plus the protospacer/PAM and some flank
+  from <- max(1L, min(ps, cs, pamS, haS) - 3L)
+  to   <- min(glen, max(pe, cs + 2L, pamE, haE) + 3L)
   pos  <- from:to
 
   feat_of <- function(p) {
@@ -142,31 +143,38 @@ render_design_ggmap <- function(design_row, system) {
     data.frame(pos = pos, y = 1, base = ed, feature = features, changed = (wt != ed),
                stringsAsFactors = FALSE)
   )
-  d$tcol <- ifelse(d$changed, "#C0392B", fcol[d$feature])
-  d$tsize <- ifelse(d$changed, 6.0, 4.4)
+  # SnapGene-style stagger: edited bases that differ from WT are lifted one block
+  # up out of the row so they pop out.
+  d$yplot <- ifelse(d$changed, d$y + 0.45, d$y)
+  d$tcol  <- ifelse(d$changed, "#C0392B", fcol[d$feature])
+  d$tsize <- ifelse(d$changed, 5.6, 3.9)
   d$tface <- ifelse(d$changed, "bold", "plain")
 
-  # feature band labels (one per contiguous run)
+  # one label per feature type (at the midpoint of its longest run)
   rr <- rle(features); ends <- cumsum(rr$lengths); starts <- ends - rr$lengths + 1L
   lab_names <- c(protospacer = "protospacer", PAM = "PAM", HA = "HA (donor)",
                  edit = "edit", silentPAM = "silent PAM")
-  labs <- do.call(rbind, lapply(seq_along(rr$values), function(k) {
-    if (rr$values[k] == "none") return(NULL)
-    data.frame(pos = pos[round((starts[k] + ends[k]) / 2)],
-               feature = rr$values[k], label = unname(lab_names[rr$values[k]]),
+  runs_df <- data.frame(feature = rr$values, len = rr$lengths,
+                        mid = pos[round((starts + ends) / 2)], stringsAsFactors = FALSE)
+  runs_df <- runs_df[runs_df$feature != "none", , drop = FALSE]
+  labs <- do.call(rbind, lapply(split(runs_df, runs_df$feature), function(x) {
+    x <- x[which.max(x$len), ]
+    data.frame(pos = x$mid, feature = x$feature, label = unname(lab_names[x$feature]),
                stringsAsFactors = FALSE)
   }))
 
-  gg <- ggplot2::ggplot(d, ggplot2::aes(pos, y)) +
-    ggplot2::geom_tile(ggplot2::aes(fill = feature), width = 1, height = 0.92, alpha = 0.16, colour = NA) +
-    ggplot2::geom_tile(data = d[d$changed, , drop = FALSE], width = 0.96, height = 0.9,
-                       fill = NA, colour = "#C0392B", linewidth = 0.7) +
-    ggplot2::geom_text(ggplot2::aes(label = base, colour = tcol, size = tsize),
+  gg <- ggplot2::ggplot(d) +
+    ggplot2::geom_tile(ggplot2::aes(pos, y, fill = feature), width = 1, height = 0.92,
+                       alpha = 0.16, colour = NA) +
+    ggplot2::geom_tile(data = d[d$changed, , drop = FALSE],
+                       ggplot2::aes(pos, yplot), width = 0.92, height = 0.82,
+                       fill = "white", colour = "#C0392B", linewidth = 0.6) +
+    ggplot2::geom_text(ggplot2::aes(pos, yplot, label = base, colour = tcol, size = tsize),
                        fontface = d$tface, family = "mono") +
     ggplot2::scale_fill_manual(values = fcol, guide = "none") +
     ggplot2::scale_colour_identity() + ggplot2::scale_size_identity() +
     ggplot2::scale_y_continuous(breaks = c(1, 2), labels = c("after edit", "wild type"),
-                                limits = c(0.3, 3.1)) +
+                                limits = c(0.3, 3.3)) +
     ggplot2::labs(x = sprintf("%s position (reading frame)", key), y = NULL,
                   title = sprintf("%s   %s→%s   gRNA on %s strand, PAM %s bp from edit",
                                   design_row$mutation, design_row$original_codon,
@@ -178,13 +186,15 @@ render_design_ggmap <- function(design_row, system) {
                    plot.title = ggplot2::element_text(size = 11, face = "bold"))
 
   if (!is.null(labs) && nrow(labs) > 0) {
+    # lift the single-base silent-PAM label so it clears the adjacent PAM label
+    labs$ylab <- ifelse(labs$feature == "silentPAM", 3.12, 2.8)
     gg <- gg + ggplot2::geom_text(data = labs,
-             ggplot2::aes(pos, 2.8, label = label, colour = fcol[feature]),
-             inherit.aes = FALSE, size = 3.4, fontface = "bold")
+             ggplot2::aes(pos, ylab, label = label, colour = fcol[feature]),
+             size = 3.4, fontface = "bold")
   }
   # protospacer 5'->3' direction arrow
   ax <- if (identical(design_row$strand, "+")) c(ps, pe) else c(pe, ps)
-  gg <- gg + ggplot2::annotate("segment", x = ax[1], xend = ax[2], y = 0.55, yend = 0.55,
+  gg <- gg + ggplot2::annotate("segment", x = ax[1], xend = ax[2], y = 0.5, yend = 0.5,
              colour = "#2C7FB8", linewidth = 0.9,
              arrow = grid::arrow(length = grid::unit(0.12, "inches"), type = "closed"))
   gg
@@ -196,16 +206,22 @@ offtarget_alignment_html <- function(guide, ot_row) {
   guide <- toupper(guide); ot <- toupper(ot_row$protospacer)
   n <- min(nchar(guide), nchar(ot))
   g <- strsplit(guide, "")[[1]]; o <- strsplit(ot, "")[[1]]
+  # mismatched bases are lifted out of their row (guide up, off-target down) so
+  # they pop out, SnapGene-style; matching bases stay in line.
+  cell <- function(ch, mm, offset) {
+    if (!mm) return(sprintf("<span style='color:#555'>%s</span>", ch))
+    sprintf("<span style='color:#C0392B;font-weight:700;position:relative;top:%s'>%s</span>",
+            offset, ch)
+  }
   topc <- character(n); midc <- character(n); botc <- character(n)
   for (i in seq_len(n)) {
     mm <- g[i] != o[i]
-    col <- if (mm) "#C0392B" else "#444"
-    topc[i] <- .span(g[i], color = col, bold = mm)
-    botc[i] <- .span(o[i], color = col, bold = mm)
-    midc[i] <- if (mm) .span("&times;", color = "#C0392B", bold = TRUE) else .span("|", color = "#9fb6c7")
+    topc[i] <- cell(g[i], mm, "-9px")
+    botc[i] <- cell(o[i], mm, "9px")
+    midc[i] <- if (mm) "<span>&nbsp;</span>" else "<span style='color:#9fb6c7'>|</span>"
   }
   row <- function(lead, cells) paste0(
-    "<div style='font-family:monospace;font-size:16px;letter-spacing:3px;white-space:nowrap'>",
+    "<div style='font-family:monospace;font-size:16px;letter-spacing:3px;white-space:nowrap;line-height:1.9'>",
     "<span style='color:#888'>", lead, "</span>", paste(cells, collapse = ""), "</div>")
 
   gene_lbl <- if (is.null(ot_row$gene) || is.na(ot_row$gene)) "intergenic" else paste0("<i>", ot_row$gene, "</i>")

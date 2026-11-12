@@ -148,19 +148,24 @@ count_off_targets_fast <- function(protospacer, pam_data, target_position) {
 #' PAM-proximal seed matches with more distal differences ("seed-only").
 find_off_targets <- function(protospacer, pam_data, target_position,
                              genome_seq = NULL, gene_metadata = NULL,
-                             max_mismatch = MAX_MISMATCHES, max_report = 500) {
+                             max_mismatch = MAX_MISMATCHES, max_report = 500,
+                             exclude_window = 23) {
   protospacer <- toupper(protospacer)
   pam_index <- pam_data$index
   proto_dna <- pam_data$proto_dna
   qchars <- strsplit(protospacer, "")[[1]]
   qseed  <- substr(protospacer, 10, 20)
 
-  # Candidate rows = union of (<=max_mismatch full match) and (exact seed match)
+  # Candidate rows = union of (<=max_mismatch full match) and (exact seed match).
+  # Exclude anything within the on-target's own footprint (|pos - target| <=
+  # exclude_window): those are the on-target itself and its 1-bp-shifted frames,
+  # which share the seed at a frameshifted register and are not real off-targets.
   query  <- Biostrings::DNAString(protospacer)
   mm_hit <- Biostrings::vcountPattern(query, proto_dna, max.mismatch = max_mismatch,
                                       min.mismatch = 0, with.indels = FALSE) > 0
   seed_hit <- pam_index$seed == qseed
-  keep <- which((mm_hit | seed_hit) & pam_index$pam_position != target_position)
+  keep <- which((mm_hit | seed_hit) &
+                abs(pam_index$pam_position - target_position) > exclude_window)
   if (length(keep) == 0) return(data.frame())
 
   sub <- pam_index[keep, ]
