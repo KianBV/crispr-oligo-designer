@@ -23,6 +23,10 @@ NCBI_EFETCH             <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch
 DEFAULT_GENOME_ACCESSION <- "CP009273.1"   # E. coli BW25113 (Keio parent)
 GENOME_CACHE_DIR         <- file.path(Sys.getenv("HOME"), ".ecoli_grna_cache")
 
+# Bump when the initialised-system object structure changes, so stale on-disk
+# caches (<key>.system.rds) are rejected and rebuilt. See initialize_system_fast.
+SYSTEM_CACHE_VERSION     <- 1L
+
 # Build NCBI E-utilities download URLs from a nuccore accession.
 ncbi_fasta_url <- function(accession) {
   paste0(NCBI_EFETCH, "?db=nuccore&id=", accession, "&rettype=fasta&retmode=text")

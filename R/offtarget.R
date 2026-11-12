@@ -138,3 +138,69 @@ count_off_targets_fast <- function(protospacer, pam_data, target_position) {
     off_target_class = off_target_class
   )
 }
+
+#' Enumerate the actual off-target sites for one protospacer (on-demand; for the
+#' design inspector, not the hot design loop). Returns a data.frame of hits with
+#' genomic position, strand, mismatch count, whether the seed is shared, the
+#' off-target protospacer + PAM, and the gene it falls in.
+#'
+#' Includes both <= max_mismatch full-length hits ("mismatch") and exact
+#' PAM-proximal seed matches with more distal differences ("seed-only").
+find_off_targets <- function(protospacer, pam_data, target_position,
+                             genome_seq = NULL, gene_metadata = NULL,
+                             max_mismatch = MAX_MISMATCHES, max_report = 500) {
+  protospacer <- toupper(protospacer)
+  pam_index <- pam_data$index
+  proto_dna <- pam_data$proto_dna
+  qchars <- strsplit(protospacer, "")[[1]]
+  qseed  <- substr(protospacer, 10, 20)
+
+  # Candidate rows = union of (<=max_mismatch full match) and (exact seed match)
+  query  <- Biostrings::DNAString(protospacer)
+  mm_hit <- Biostrings::vcountPattern(query, proto_dna, max.mismatch = max_mismatch,
+                                      min.mismatch = 0, with.indels = FALSE) > 0
+  seed_hit <- pam_index$seed == qseed
+  keep <- which((mm_hit | seed_hit) & pam_index$pam_position != target_position)
+  if (length(keep) == 0) return(data.frame())
+
+  sub <- pam_index[keep, ]
+  protos <- sub$protospacer
+  mm <- vapply(protos, function(s) sum(strsplit(s, "")[[1]] != qchars), integer(1))
+  seedmatch <- substr(protos, 10, 20) == qseed
+
+  df <- data.frame(
+    type        = ifelse(mm <= max_mismatch, "mismatch", "seed-only"),
+    position    = sub$pam_position,
+    strand      = sub$strand,
+    mismatches  = mm,
+    seed_match  = seedmatch,
+    protospacer = protos,
+    stringsAsFactors = FALSE
+  )
+
+  # PAM as it reads on the guide strand (NGG)
+  if (!is.null(genome_seq)) {
+    gl <- nchar(genome_seq)
+    df$pam <- mapply(function(pos, st) {
+      if (pos < 1 || pos + 2 > gl) return(NA_character_)
+      tri <- substr(genome_seq, pos, pos + 2)
+      if (identical(st, "-")) reverse_complement(tri) else tri
+    }, df$position, df$strand, USE.NAMES = FALSE)
+  }
+
+  # Gene containing each off-target (genomic ranges)
+  if (!is.null(gene_metadata) && length(gene_metadata) > 0) {
+    gn <- names(gene_metadata)
+    gs <- vapply(gene_metadata, function(m) as.numeric(m$genomic_start), numeric(1))
+    ge <- vapply(gene_metadata, function(m) as.numeric(m$genomic_end), numeric(1))
+    df$gene <- vapply(df$position, function(p) {
+      hit <- which(gs <= p & ge >= p)
+      if (length(hit)) gn[hit[1]] else NA_character_
+    }, character(1))
+  }
+
+  df <- df[order(df$mismatches, !df$seed_match), , drop = FALSE]  # worst first
+  if (nrow(df) > max_report) df <- df[seq_len(max_report), , drop = FALSE]
+  rownames(df) <- NULL
+  df
+}

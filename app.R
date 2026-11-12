@@ -8,7 +8,8 @@
 
 # --- Load backend modules (order matters for top-level definitions) -----------
 .backend_files <- c("packages.R", "constants.R", "config.R", "genome.R",
-                    "offtarget.R", "design.R", "microsynth.R", "qc.R", "pipeline.R")
+                    "offtarget.R", "design.R", "microsynth.R", "qc.R",
+                    "genome_view.R", "pipeline.R")
 for (.f in .backend_files) source(file.path("R", .f))
 
 load_gui_packages()
@@ -178,6 +179,8 @@ ui <- bslib::page_sidebar(
         shiny::downloadButton("dl_all", "Download all designs CSV",
                               class = "btn-outline-secondary btn-sm")
       ),
+      shiny::p(shiny::tags$small(shiny::icon("hand-pointer"),
+               " Click a row to inspect it (genomic map, sequence, off-targets).")),
       DT::DTOutput("results_table")
     ),
 
@@ -202,6 +205,26 @@ ui <- bslib::page_sidebar(
                               class = "btn-outline-secondary btn-sm")),
       shiny::uiOutput("qc_backend_note"),
       DT::DTOutput("qc_table_out")
+    ),
+
+    bslib::nav_panel(
+      "Inspector", icon = shiny::icon("magnifying-glass-chart"),
+      shiny::uiOutput("inspector_header"),
+      shiny::conditionalPanel(
+        condition = "output.inspector_ready == true",
+        bslib::card(
+          bslib::card_header("Genomic map"),
+          shiny::plotOutput("inspector_map", height = "360px")
+        ),
+        bslib::card(
+          bslib::card_header("Sequence & components"),
+          shiny::uiOutput("inspector_seq")
+        ),
+        bslib::card(
+          bslib::card_header(shiny::uiOutput("inspector_ot_header")),
+          DT::DTOutput("inspector_offtargets")
+        )
+      )
     ),
 
     bslib::nav_panel(
@@ -502,12 +525,28 @@ server <- function(input, output, session) {
   })
 
   # ==== Results ==============================================================
-  output$results_table <- DT::renderDT({
+  results_view_df <- shiny::reactive({
     shiny::req(rv$results_all)
-    df <- if (input$results_view == "top") rv$results_top else rv$results_all
+    if (input$results_view == "top") rv$results_top else rv$results_all
+  })
+
+  output$results_table <- DT::renderDT({
+    df <- results_view_df()
     shiny::validate(shiny::need(!is.null(df) && nrow(df) > 0, "No rows for the current filter."))
-    DT::datatable(df, filter = "top", rownames = FALSE,
+    DT::datatable(df, filter = "top", rownames = FALSE, selection = "single",
                   options = list(pageLength = 15, scrollX = TRUE))
+  })
+
+  # The design row currently selected in the Results table (for the Inspector)
+  selected_design <- shiny::reactive({
+    sel <- input$results_table_rows_selected
+    df <- results_view_df()
+    if (is.null(sel) || length(sel) == 0 || is.null(df) || nrow(df) == 0) return(NULL)
+    df[sel[1], , drop = FALSE]
+  })
+
+  shiny::observeEvent(input$results_table_rows_selected, {
+    if (length(input$results_table_rows_selected)) bslib::nav_select("main_tabs", "Inspector")
   })
 
   output$dl_all <- shiny::downloadHandler(
@@ -625,6 +664,55 @@ server <- function(input, output, session) {
     filename = function() paste0("oligo_qc_", Sys.Date(), ".csv"),
     content = function(file) utils::write.csv(oligo_qc(), file, row.names = FALSE)
   )
+
+  # ==== Inspector (select a design in Results) ===============================
+  output$inspector_ready <- shiny::reactive(!is.null(selected_design()))
+  shiny::outputOptions(output, "inspector_ready", suspendWhenHidden = FALSE)
+
+  output$inspector_header <- shiny::renderUI({
+    d <- selected_design()
+    if (is.null(d)) {
+      return(shiny::p("Select a design row in the ", shiny::strong("Results"),
+                      " tab to inspect it — genomic map, sequence, and off-targets."))
+    }
+    shiny::h5(sprintf("%s  —  %s→%s in %s  (rank %s, score %s, gRNA on %s strand)",
+                      d$mutation, d$original_codon, d$mutant_codon, d$gene, d$rank,
+                      d$score, if (identical(d$strand, "+")) "+" else "−"))
+  })
+
+  inspector_offtargets <- shiny::reactive({
+    d <- selected_design(); shiny::req(d, rv$system)
+    tryCatch(design_off_targets(d, rv$system), error = function(e) data.frame())
+  })
+
+  output$inspector_map <- shiny::renderPlot({
+    d <- selected_design(); shiny::req(d, rv$system)
+    if (!gviz_available()) {
+      graphics::plot.new()
+      graphics::text(0.5, 0.5, "Install Gviz for the genomic map:\nBiocManager::install('Gviz')")
+      return(invisible())
+    }
+    render_design_view(d, rv$system)
+  })
+
+  output$inspector_seq <- shiny::renderUI({
+    d <- selected_design(); shiny::req(d, rv$system)
+    shiny::HTML(design_sequence_html(d, rv$system))
+  })
+
+  output$inspector_ot_header <- shiny::renderUI({
+    ot <- inspector_offtargets()
+    n <- if (is.null(ot)) 0 else nrow(ot)
+    paste0("Off-target sites (", n, ")")
+  })
+
+  output$inspector_offtargets <- DT::renderDT({
+    ot <- inspector_offtargets()
+    shiny::validate(shiny::need(!is.null(ot) && nrow(ot) > 0,
+                                "No off-target sites (≤4 mismatches or shared seed)."))
+    DT::datatable(ot, rownames = FALSE, filter = "top",
+                  options = list(pageLength = 10, scrollX = TRUE))
+  })
 
   # ==== Summary ==============================================================
   output$summary_text <- shiny::renderText({

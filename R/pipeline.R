@@ -170,6 +170,20 @@ build_oligo_orders <- function(results_top, cfg) {
   )
 }
 
+#' Off-target sites for a single selected design (for the design inspector).
+#' Reconstructs the on-target genomic position from the stored gene-local
+#' coordinates so it is excluded correctly, then enumerates the hits.
+design_off_targets <- function(design_row, system, max_mismatch = MAX_MISMATCHES) {
+  tp <- gene_local_to_genomic(as.integer(design_row$pam_position),
+                              as.numeric(design_row$gene_genomic_start),
+                              as.numeric(design_row$gene_genomic_end),
+                              as.character(design_row$gene_strand))
+  find_off_targets(design_row$protospacer, system$pam_data, tp,
+                   genome_seq = system$genome_seq,
+                   gene_metadata = system$gene_metadata,
+                   max_mismatch = max_mismatch)
+}
+
 #' QC the oligos produced for the given designs. Returns a QC data.frame.
 qc_oligo_orders <- function(results_top, cfg) {
   orders <- build_oligo_orders(results_top, cfg)

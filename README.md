@@ -216,6 +216,30 @@ pip install primer3-py      # needs Python on PATH
 
 Set `qc.thermo_backend` to `auto` (default), `builtin`, or `off` in the config.
 
+### Design inspector
+
+**Click any row in the Results table** to open the **Inspector**, which shows that
+design in detail:
+
+- **Genomic map** — a SnapGene-style [Gviz](https://bioconductor.org/packages/Gviz/)
+  track of the gene with the protospacer, PAM, homology arm (donor), edited codon
+  and silent PAM mutation, strand-aware. (Optional; `BiocManager::install("Gviz")`.
+  Without Gviz the rest of the inspector still works.)
+- **Sequence & components** — the local gene sequence as **wild-type vs edited**
+  rows with every component coloured and the changed bases highlighted, plus a
+  table of each component's full sequence (protospacer, codon change, silent
+  mutation, and the repair donor with its edits marked).
+- **Off-targets** — the actual off-target sites for that guide: genomic position,
+  strand, mismatch count, exact-seed vs mismatch, the off-target protospacer + PAM,
+  and the gene it lands in. Computed on demand for the selected guide only.
+
+### Startup speed
+
+The first time a genome is loaded, the fully-built system (PAM index, gene
+sequences, codon usage) is **cached to disk** (`<accession>.system.rds` in the
+genome cache). Subsequent loads of the same strain — and strain switching — drop
+from ~**100 s to ~3 s**. `Force re-download` rebuilds the cache.
+
 ---
 
 ## Configuration
@@ -269,6 +293,7 @@ session). Key parameters:
 │   ├── design.R          #   gRNA design, homology arm, oligo assembly, library design
 │   ├── microsynth.R      #   oligo order generation (Gibson + Golden Gate) + form filling
 │   ├── qc.R              #   oligo QC: Tm, GC, hairpin, dimer, enzyme sites (+primer3)
+│   ├── genome_view.R     #   design inspector: Gviz map + sequence/component HTML
 ├── tools/primer3_calc.py # optional primer3-py backend for accurate ΔG
 │   └── pipeline.R        #   input reading, validation, orchestration, summaries
 ├── templates/            # Put the Microsynth .xlsx template here

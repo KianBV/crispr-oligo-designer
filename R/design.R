@@ -433,6 +433,14 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
                                              gene_meta$genomic_start, gene_meta$strand)
       oligo <- generate_200bp_oligo(design, homology_arm)
 
+      # Gene-local coordinates of the designed elements (for the genome view)
+      pamp <- design$pam_position
+      if (identical(design$strand, "+")) {
+        proto_start <- pamp - 20; proto_end <- pamp - 1
+      } else {
+        proto_start <- pamp + 3;  proto_end <- pamp + 22
+      }
+
       data.frame(
         mutation = mut_str, gene = mutation$gene, position = mutation$position,
         wt_aa = mutation$wt_aa, mut_aa = mutation$mut_aa, rank = i,
@@ -443,7 +451,16 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
         mutant_codon = design$mutant_codon, pam_mutation = design$pam_mutation$codon_change,
         pam_mutation_freq_diff = design$pam_mutation$freq_diff,
         homology_arm = homology_arm$sequence, oligo_200bp = oligo$oligo_sequence,
-        oligo_length = oligo$length, stringsAsFactors = FALSE
+        oligo_length = oligo$length,
+        # --- gene-local coordinates for the design inspector / genome view ---
+        codon_start = design$codon_start, pam_position = pamp,
+        proto_start = proto_start, proto_end = proto_end,
+        ha_start = homology_arm$start, ha_end = homology_arm$end,
+        silent_mut_pos = design$pam_mutation$position,
+        gene_genomic_start = gene_meta$genomic_start,
+        gene_genomic_end = gene_meta$genomic_end,
+        gene_strand = gene_meta$strand,
+        stringsAsFactors = FALSE
       )
     })
 
@@ -520,10 +537,12 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
 #' @param source a genome source list from strain_source()/custom_source().
 #'   For backward compatibility, a bare accession string or NULL (= default
 #'   strain) is also accepted.
-#' @param force_download re-download cached NCBI genomes/annotations
+#' @param force_download re-download cached NCBI genomes/annotations and rebuild
+#'   the cached system (ignore any <key>.system.rds).
+#' @param use_cache load/save the initialised-system disk cache (default TRUE)
 #' @param progress_callback optional function(fraction, message) for the GUI
 initialize_system_fast <- function(source = NULL, force_download = FALSE,
-                                    progress_callback = NULL) {
+                                    use_cache = TRUE, progress_callback = NULL) {
   # Normalise the source argument
   if (is.null(source)) {
     source <- strain_source(DEFAULT_GENOME_ACCESSION, "BW25113 (default)")
@@ -533,6 +552,18 @@ initialize_system_fast <- function(source = NULL, force_download = FALSE,
 
   cat("\n=== Initializing System (Fast Version) ===\n\n")
   cat("Genome source:", source$name, "\n")
+
+  # Fast path: reuse a cached, fully-built system (skips the ~100 s build)
+  if (isTRUE(use_cache) && !isTRUE(force_download)) {
+    cached <- load_cached_system(source)
+    if (!is.null(cached)) {
+      cat("Loaded cached system (", length(cached$gene_sequences), "genes).\n")
+      cached$genome_name <- source$name
+      if (!is.null(progress_callback)) progress_callback(1.0, "Loaded cached genome.")
+      return(cached)
+    }
+  }
+
   if (!is.null(progress_callback)) progress_callback(0.05, "Loading genome...")
 
   empty_gene_data <- list(sequences = list(), metadata = list(), id_maps = list(),
@@ -593,9 +624,8 @@ initialize_system_fast <- function(source = NULL, force_download = FALSE,
   }
 
   cat("\nSystem ready!\n")
-  if (!is.null(progress_callback)) progress_callback(1.0, "Genome ready.")
 
-  list(
+  system <- list(
     genome = genome,
     genome_seq = genome_seq,
     genome_name = source$name,
@@ -606,4 +636,13 @@ initialize_system_fast <- function(source = NULL, force_download = FALSE,
     id_types = gene_data$id_types,
     codon_freq = codon_freq
   )
+
+  # Cache the fully-built system so the next load of this genome is near-instant
+  if (isTRUE(use_cache)) {
+    if (!is.null(progress_callback)) progress_callback(0.97, "Caching system...")
+    if (isTRUE(save_cached_system(system, source))) cat("Cached system for fast re-loading.\n")
+  }
+  if (!is.null(progress_callback)) progress_callback(1.0, "Genome ready.")
+
+  system
 }

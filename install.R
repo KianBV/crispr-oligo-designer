@@ -8,6 +8,10 @@
 cran_packages <- c("shiny", "DT", "shinyjs", "bslib",
                    "dplyr", "stringr", "data.table", "openxlsx", "yaml")
 bioc_packages <- c("Biostrings", "GenomicFeatures", "rtracklayer")
+# Optional: Gviz powers the design inspector's genomic map (the app works
+# without it — the map degrades to a message; the sequence view, components and
+# off-targets still work). It is heavy, so it is installed best-effort below.
+bioc_optional <- c("Gviz")
 
 message("== Installing CRAN packages ==")
 installed <- rownames(installed.packages())
@@ -35,7 +39,19 @@ missing <- setdiff(c(cran_packages, bioc_packages), rownames(installed.packages(
 if (length(missing) > 0) {
   stop("These packages failed to install: ", paste(missing, collapse = ", "))
 }
-message("\nAll R dependencies installed. Launch the app with:  Rscript run.R")
+message("\nAll core R dependencies installed. Launch the app with:  Rscript run.R")
+
+# Optional: Gviz (genomic map in the design inspector), best-effort.
+to_install_opt <- setdiff(bioc_optional, rownames(installed.packages()))
+if (length(to_install_opt) > 0) {
+  message("\nInstalling optional Gviz (genomic map; this can take a few minutes)...")
+  tryCatch(BiocManager::install(to_install_opt, ask = FALSE, update = FALSE),
+           error = function(e) message("  -> Gviz install skipped/failed: ", conditionMessage(e),
+                                       "\n     The app still runs; the inspector map will show a hint."))
+}
+message(if ("Gviz" %in% rownames(installed.packages()))
+        "  -> Gviz detected: genomic map is ON." else
+        "  -> Gviz not installed; the inspector map will be unavailable (everything else works).")
 
 # Optional: accurate thermodynamic QC (hairpin / dimer Delta-G) via primer3-py.
 # The app works without it (falls back to built-in heuristics), but for true
