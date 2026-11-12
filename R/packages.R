@@ -15,7 +15,7 @@
 .BIOC_PACKAGES <- c("Biostrings", "GenomicFeatures", "rtracklayer")
 
 # Packages required only by the Shiny GUI layer
-.GUI_PACKAGES <- c("shiny", "DT", "shinyjs", "bslib")
+.GUI_PACKAGES <- c("shiny", "DT", "shinyjs", "bslib", "ggplot2")
 
 #' Load a set of packages, collecting any that are missing.
 #' @return character vector of packages that could not be loaded

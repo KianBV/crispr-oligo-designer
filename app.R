@@ -213,8 +213,8 @@ ui <- bslib::page_sidebar(
       shiny::conditionalPanel(
         condition = "output.inspector_ready == true",
         bslib::card(
-          bslib::card_header("Genomic map"),
-          shiny::plotOutput("inspector_map", height = "360px")
+          bslib::card_header("Alignment map (wild type vs edit)"),
+          shiny::plotOutput("inspector_map", height = "300px")
         ),
         bslib::card(
           bslib::card_header("Sequence & components"),
@@ -222,6 +222,7 @@ ui <- bslib::page_sidebar(
         ),
         bslib::card(
           bslib::card_header(shiny::uiOutput("inspector_ot_header")),
+          shiny::uiOutput("inspector_ot_align"),
           DT::DTOutput("inspector_offtargets")
         )
       )
@@ -687,12 +688,7 @@ server <- function(input, output, session) {
 
   output$inspector_map <- shiny::renderPlot({
     d <- selected_design(); shiny::req(d, rv$system)
-    if (!gviz_available()) {
-      graphics::plot.new()
-      graphics::text(0.5, 0.5, "Install Gviz for the genomic map:\nBiocManager::install('Gviz')")
-      return(invisible())
-    }
-    render_design_view(d, rv$system)
+    render_design_ggmap(d, rv$system)
   })
 
   output$inspector_seq <- shiny::renderUI({
@@ -710,8 +706,20 @@ server <- function(input, output, session) {
     ot <- inspector_offtargets()
     shiny::validate(shiny::need(!is.null(ot) && nrow(ot) > 0,
                                 "No off-target sites (≤4 mismatches or shared seed)."))
-    DT::datatable(ot, rownames = FALSE, filter = "top",
+    DT::datatable(ot, rownames = FALSE, filter = "top", selection = "single",
                   options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$inspector_ot_align <- shiny::renderUI({
+    ot <- inspector_offtargets(); d <- selected_design()
+    if (is.null(ot) || nrow(ot) == 0 || is.null(d)) return(NULL)
+    sel <- input$inspector_offtargets_rows_selected
+    if (is.null(sel) || length(sel) == 0) {
+      return(shiny::p(shiny::tags$small(shiny::icon("hand-pointer"),
+                      " Click an off-target row to align it to the guide (mismatches in red).")))
+    }
+    shiny::div(class = "mb-3 p-2", style = "background:#f8f9fa;border-radius:6px",
+               shiny::HTML(offtarget_alignment_html(d$protospacer, ot[sel[1], , drop = FALSE])))
   })
 
   # ==== Summary ==============================================================

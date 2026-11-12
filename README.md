@@ -221,17 +221,19 @@ Set `qc.thermo_backend` to `auto` (default), `builtin`, or `off` in the config.
 **Click any row in the Results table** to open the **Inspector**, which shows that
 design in detail:
 
-- **Genomic map** — a SnapGene-style [Gviz](https://bioconductor.org/packages/Gviz/)
-  track of the gene with the protospacer, PAM, homology arm (donor), edited codon
-  and silent PAM mutation, strand-aware. (Optional; `BiocManager::install("Gviz")`.
-  Without Gviz the rest of the inspector still works.)
-- **Sequence & components** — the local gene sequence as **wild-type vs edited**
-  rows with every component coloured and the changed bases highlighted, plus a
-  table of each component's full sequence (protospacer, codon change, silent
-  mutation, and the repair donor with its edits marked).
+- **Alignment map** — a lightweight ggplot of the functional region as **actual
+  aligned letters** in two rows (*wild type* vs *after edit*), coloured by
+  component (protospacer, PAM, HA/donor), with the edited codon and silent PAM
+  mutation **popping out in boxed red**, and a strand-aware guide arrow. (A Gviz
+  feature-box alternative, `render_design_view()`, is also available but Gviz is
+  not required.)
+- **Sequence & components** — the local gene sequence as wild-type vs edited rows,
+  plus a table of each component's full sequence (protospacer, codon change,
+  silent mutation, and the repair donor with its edits marked).
 - **Off-targets** — the actual off-target sites for that guide: genomic position,
   strand, mismatch count, exact-seed vs mismatch, the off-target protospacer + PAM,
-  and the gene it lands in. Computed on demand for the selected guide only.
+  and the gene it lands in. **Click an off-target row** to see the guide aligned
+  against it, with mismatches highlighted in red. Computed on demand per guide.
 
 ### Startup speed
 

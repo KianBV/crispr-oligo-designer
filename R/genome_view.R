@@ -92,6 +92,135 @@ render_design_view <- function(design_row, system, pad = 18) {
 }
 
 # ==============================================================================
+# ggplot "alignment map": actual letters, aligned, edits popping out
+# ==============================================================================
+
+gg_available <- function() requireNamespace("ggplot2", quietly = TRUE)
+
+#' Lightweight sequence-alignment map (ggplot): the functional region as letters
+#' in two aligned rows (wild type / after edit), coloured by component, with the
+#' edited codon and silent PAM mutation popping out in red. No Gviz needed.
+render_design_ggmap <- function(design_row, system) {
+  if (!gg_available()) stop("ggplot2 is not installed.", call. = FALSE)
+  key <- tryCatch(resolve_gene_id(design_row$gene, system$id_maps, "auto"),
+                  error = function(e) NULL)
+  if (is.null(key)) key <- as.character(design_row$gene)
+  gene <- toupper(system$gene_sequences[[key]])
+  if (is.null(gene) || !nzchar(gene)) stop("Gene sequence unavailable.", call. = FALSE)
+  glen <- nchar(gene)
+
+  cs  <- as.integer(design_row$codon_start)
+  ps  <- min(as.integer(design_row$proto_start), as.integer(design_row$proto_end))
+  pe  <- max(as.integer(design_row$proto_start), as.integer(design_row$proto_end))
+  pamS <- as.integer(design_row$pam_position); pamE <- pamS + 2L
+  smp <- as.integer(design_row$silent_mut_pos)
+  haS <- as.integer(design_row$ha_start); haE <- as.integer(design_row$ha_end)
+  ha  <- toupper(design_row$homology_arm)
+  edited_base <- function(p) if (p >= haS && p <= haE) substr(ha, p - haS + 1L, p - haS + 1L) else substr(gene, p, p)
+
+  from <- max(1L, min(ps, cs, pamS) - 3L)
+  to   <- min(glen, max(pe, cs + 2L, pamE) + 3L)
+  pos  <- from:to
+
+  feat_of <- function(p) {
+    if (p >= cs && p <= cs + 2L) return("edit")
+    if (p == smp) return("silentPAM")
+    if (p >= pamS && p <= pamE) return("PAM")
+    if (p >= ps && p <= pe) return("protospacer")
+    if (p >= haS && p <= haE) return("HA")
+    "none"
+  }
+  features <- vapply(pos, feat_of, character(1))
+  wt <- vapply(pos, function(p) substr(gene, p, p), character(1))
+  ed <- vapply(pos, edited_base, character(1))
+
+  fcol <- c(protospacer = "#2C7FB8", PAM = "#D95F0E", HA = "#31A354",
+            edit = "#E34A33", silentPAM = "#756BB1", none = "grey35")
+  d <- rbind(
+    data.frame(pos = pos, y = 2, base = wt, feature = features, changed = FALSE,
+               stringsAsFactors = FALSE),
+    data.frame(pos = pos, y = 1, base = ed, feature = features, changed = (wt != ed),
+               stringsAsFactors = FALSE)
+  )
+  d$tcol <- ifelse(d$changed, "#C0392B", fcol[d$feature])
+  d$tsize <- ifelse(d$changed, 6.0, 4.4)
+  d$tface <- ifelse(d$changed, "bold", "plain")
+
+  # feature band labels (one per contiguous run)
+  rr <- rle(features); ends <- cumsum(rr$lengths); starts <- ends - rr$lengths + 1L
+  lab_names <- c(protospacer = "protospacer", PAM = "PAM", HA = "HA (donor)",
+                 edit = "edit", silentPAM = "silent PAM")
+  labs <- do.call(rbind, lapply(seq_along(rr$values), function(k) {
+    if (rr$values[k] == "none") return(NULL)
+    data.frame(pos = pos[round((starts[k] + ends[k]) / 2)],
+               feature = rr$values[k], label = unname(lab_names[rr$values[k]]),
+               stringsAsFactors = FALSE)
+  }))
+
+  gg <- ggplot2::ggplot(d, ggplot2::aes(pos, y)) +
+    ggplot2::geom_tile(ggplot2::aes(fill = feature), width = 1, height = 0.92, alpha = 0.16, colour = NA) +
+    ggplot2::geom_tile(data = d[d$changed, , drop = FALSE], width = 0.96, height = 0.9,
+                       fill = NA, colour = "#C0392B", linewidth = 0.7) +
+    ggplot2::geom_text(ggplot2::aes(label = base, colour = tcol, size = tsize),
+                       fontface = d$tface, family = "mono") +
+    ggplot2::scale_fill_manual(values = fcol, guide = "none") +
+    ggplot2::scale_colour_identity() + ggplot2::scale_size_identity() +
+    ggplot2::scale_y_continuous(breaks = c(1, 2), labels = c("after edit", "wild type"),
+                                limits = c(0.3, 3.1)) +
+    ggplot2::labs(x = sprintf("%s position (reading frame)", key), y = NULL,
+                  title = sprintf("%s   %s→%s   gRNA on %s strand, PAM %s bp from edit",
+                                  design_row$mutation, design_row$original_codon,
+                                  design_row$mutant_codon,
+                                  if (identical(design_row$strand, "+")) "+" else "−",
+                                  design_row$pam_distance)) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(panel.grid = ggplot2::element_blank(),
+                   plot.title = ggplot2::element_text(size = 11, face = "bold"))
+
+  if (!is.null(labs) && nrow(labs) > 0) {
+    gg <- gg + ggplot2::geom_text(data = labs,
+             ggplot2::aes(pos, 2.8, label = label, colour = fcol[feature]),
+             inherit.aes = FALSE, size = 3.4, fontface = "bold")
+  }
+  # protospacer 5'->3' direction arrow
+  ax <- if (identical(design_row$strand, "+")) c(ps, pe) else c(pe, ps)
+  gg <- gg + ggplot2::annotate("segment", x = ax[1], xend = ax[2], y = 0.55, yend = 0.55,
+             colour = "#2C7FB8", linewidth = 0.9,
+             arrow = grid::arrow(length = grid::unit(0.12, "inches"), type = "closed"))
+  gg
+}
+
+#' Alignment of the guide protospacer against one off-target (HTML, mismatches
+#' in red with a x in the match line). `ot_row` is a row from design_off_targets().
+offtarget_alignment_html <- function(guide, ot_row) {
+  guide <- toupper(guide); ot <- toupper(ot_row$protospacer)
+  n <- min(nchar(guide), nchar(ot))
+  g <- strsplit(guide, "")[[1]]; o <- strsplit(ot, "")[[1]]
+  topc <- character(n); midc <- character(n); botc <- character(n)
+  for (i in seq_len(n)) {
+    mm <- g[i] != o[i]
+    col <- if (mm) "#C0392B" else "#444"
+    topc[i] <- .span(g[i], color = col, bold = mm)
+    botc[i] <- .span(o[i], color = col, bold = mm)
+    midc[i] <- if (mm) .span("&times;", color = "#C0392B", bold = TRUE) else .span("|", color = "#9fb6c7")
+  }
+  row <- function(lead, cells) paste0(
+    "<div style='font-family:monospace;font-size:16px;letter-spacing:3px;white-space:nowrap'>",
+    "<span style='color:#888'>", lead, "</span>", paste(cells, collapse = ""), "</div>")
+
+  gene_lbl <- if (is.null(ot_row$gene) || is.na(ot_row$gene)) "intergenic" else paste0("<i>", ot_row$gene, "</i>")
+  seedtag <- if (isTRUE(ot_row$seed_match)) " &middot; <span style='color:#C0392B'>seed match</span>" else ""
+  hdr <- sprintf(
+    "<b>%s</b> at %s (%s strand) in %s &middot; %d mismatch%s &middot; PAM %s%s",
+    ot_row$type, format(ot_row$position, big.mark = ","), ot_row$strand, gene_lbl,
+    ot_row$mismatches, if (identical(ot_row$mismatches, 1L)) "" else "es",
+    ot_row$pam %||% "NGG", seedtag)
+
+  paste0("<div class='mb-2 small'>", hdr, "</div>",
+         row("guide 5'-", topc), row("      ", midc), row("  OT  5'-", botc))
+}
+
+# ==============================================================================
 # Component sequence readout (HTML): guaranteed letters, every component shown
 # ==============================================================================
 
