@@ -27,12 +27,34 @@ design:
   # CPU cores for the design run (1 = sequential; >1 uses parallel processing).
   n_cores: 1
 
+  # --- Scoring model (see SCORING.md) ---
+  # Defaults below reproduce the original behaviour exactly. Each optional term
+  # is OFF by default; turn one on to A/B it. (A candidate is kept only if its
+  # score >= min_score_threshold, so enabling penalties filters more strictly.)
+  scoring:
+    base_scores: [5.0, 4.41, 3.9, 2.0]   # by off-target class 1..4
+    swap_class_2_3: false                 # true -> rank class 3 (exact seed match) above class 2
+    distance_step_bp: 3
+    distance_penalty_per_step: 0.2
+    distance_cap_bp: 30
+    offtarget_count_weight: 0.0           # subtract w * ln(1 + off_targets + seed_matches); 0 = off
+    activity_term: false                  # subtract GC-band + homopolymer penalties
+    gc_ideal_min: 0.40
+    gc_ideal_max: 0.65
+    gc_penalty: 0.5
+    homopolymer_max: 4
+    homopolymer_penalty: 0.5
+
 microsynth:
   # Path to the official Microsynth order-form template (.xlsx).
   # Place the file in the templates/ folder and keep this path pointing at it.
   template_path: "templates/MicrosynthUploadFormDNA__2_.xlsx"
   sheet: "DNA Order"
 
+  # Which gRNA cloning oligos to emit: "gibson", "golden_gate" or "both".
+  cloning_method: "golden_gate"
+
+  # --- Gibson primers ---
   # gRNA Gibson-assembly primer 3' homology tails. Each primer is
   #   <protospacer or its reverse complement> + <tail>
   # (tail appended at the 3' end). Tails are lowercase by convention so the
@@ -40,9 +62,20 @@ microsynth:
   fwd_tail: "gttttagagctagaaatagcaagt"   # first 24 nt of the sgRNA scaffold
   rev_tail: "actagtattatacctaggactgag"   # revcomp of the J23119 promoter 3' end
 
+  # --- Golden Gate (BsaI) annealed oligo pair ---
+  # top:  <gg_top_overhang> + protospacer ;  bottom: <gg_bot_overhang> + revcomp
+  # Defaults TAGT/AAAC are the pEcgRNA promoter/scaffold fusion sites. These are
+  # VECTOR-SPECIFIC -- set them to the 4-nt overhangs your BsaI vector produces.
+  gg_top_overhang: "TAGT"
+  gg_bot_overhang: "AAAC"
+  gg_phosphorylate: false         # order GG oligos 5'-phosphorylated for ligation
+  gg_phos_label: "Phosphate"      # exact Microsynth 5'-modification dropdown term
+
   # Oligo name suffixes.
   fwd_name_suffix: "_pEcgRNA_fw_gibson"
   rev_name_suffix: "_pEcgRNA_rv_gibson"
+  gg_top_name_suffix: "_gg_bsaI_top"
+  gg_bot_name_suffix: "_gg_bsaI_bot"
   ha_name_suffix: "_HA"
 
   # Number of 5' bases protected by phosphorothioate (PTO) bonds on the
@@ -55,6 +88,34 @@ microsynth:
   condition: "Dried"
   datasheet: "Standard"
   aliquots: "No"
+
+qc:
+  # Oligo quality control (shown in the app's QC tab; thresholds drive the flags).
+  enabled: true
+  na_mM: 50               # monovalent cation conc for Tm
+  mg_mM: 1.5              # divalent (Mg2+) conc for primer3 thermodynamics
+  dntp_mM: 0.6            # dNTP conc for primer3 thermodynamics
+  oligo_uM: 0.5           # strand concentration for Tm
+  thermo_temp: 37         # temperature for hairpin/dimer folding (deg C)
+  gc_min: 0.30            # flag GC below this fraction
+  gc_max: 0.65            # flag GC above this fraction
+  tm_min: 50              # flag primer Tm below this (deg C)
+  tm_max: 75              # flag primer Tm above this (deg C)
+  max_homopolymer: 5      # flag single-base runs >= this length
+  enzymes: ["BsaI", "BbsI"]   # internal recognition sites to check for
+
+  # --- Thermodynamic backend ---
+  # "auto": use primer3 (tools/primer3_calc.py, needs `pip install primer3-py`)
+  # when available, else the built-in heuristics. "builtin"/"off": heuristics only.
+  thermo_backend: "auto"
+  python: "python"               # python executable used to run primer3-py
+  primer3_script: "tools/primer3_calc.py"
+  hairpin_dg: -3.0        # primer3: flag hairpin dG <= this (kcal/mol)
+  dimer_dg: -6.0          # primer3: flag self-dimer dG <= this (kcal/mol)
+  # Heuristic fallbacks (used only when primer3 is unavailable):
+  hairpin_stem: 6         # flag self-complementary stems >= this many bp
+  hairpin_min_loop: 3     # minimum hairpin loop size considered
+  dimer3: 4               # flag 3' self-dimer >= this many bp
 
 export:
   # Default minimum score used when selecting top-ranked designs for the order form.

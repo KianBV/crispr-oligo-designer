@@ -80,7 +80,8 @@ build_pam_index_fast <- function(genome_sequence) {
 }
 
 #' FAST off-target counting using Biostrings vcountPattern (optimised C)
-count_off_targets_fast <- function(protospacer, pam_data, target_position) {
+count_off_targets_fast <- function(protospacer, pam_data, target_position,
+                                   exclude_window = OT_EXCLUDE_WINDOW) {
   protospacer <- toupper(protospacer)
   seed <- substr(protospacer, 10, 20)
 
@@ -88,11 +89,13 @@ count_off_targets_fast <- function(protospacer, pam_data, target_position) {
   seed_index <- pam_data$seed_index
   proto_dna <- pam_data$proto_dna
 
-  # Quick seed match check (hash lookup - O(1))
+  # Quick seed match check (hash lookup - O(1)). Exclude the on-target footprint
+  # (|pos - target| <= exclude_window): the on-target and its frameshifted
+  # registers share the seed at a shifted position but are not off-targets.
   seed_matches <- 0
   if (exists(seed, envir = seed_index)) {
     matching_positions <- seed_index[[seed]]
-    seed_matches <- sum(matching_positions != target_position)
+    seed_matches <- sum(abs(matching_positions - target_position) > exclude_window)
   }
 
   # Use Biostrings for fast approximate matching
@@ -111,11 +114,12 @@ count_off_targets_fast <- function(protospacer, pam_data, target_position) {
   # Find which ones matched
   match_indices <- which(matches_le4 > 0)
 
-  # Exclude on-target
+  # Exclude the on-target footprint (on-target + frameshifted self-overlaps),
+  # not just the exact on-target position, so the count matches the inspector's
+  # enumeration (find_off_targets uses the same window).
   if (length(match_indices) > 0) {
-    on_target_idx <- which(pam_index$pam_position == target_position)
-    match_indices <- setdiff(match_indices, on_target_idx)
-    off_target_count <- length(match_indices)
+    mpos <- pam_index$pam_position[match_indices]
+    off_target_count <- sum(abs(mpos - target_position) > exclude_window)
   }
 
   # Determine class
@@ -137,4 +141,75 @@ count_off_targets_fast <- function(protospacer, pam_data, target_position) {
     off_target_count = off_target_count,
     off_target_class = off_target_class
   )
+}
+
+#' Enumerate the actual off-target sites for one protospacer (on-demand; for the
+#' design inspector, not the hot design loop). Returns a data.frame of hits with
+#' genomic position, strand, mismatch count, whether the seed is shared, the
+#' off-target protospacer + PAM, and the gene it falls in.
+#'
+#' Includes both <= max_mismatch full-length hits ("mismatch") and exact
+#' PAM-proximal seed matches with more distal differences ("seed-only").
+find_off_targets <- function(protospacer, pam_data, target_position,
+                             genome_seq = NULL, gene_metadata = NULL,
+                             max_mismatch = MAX_MISMATCHES, max_report = 500,
+                             exclude_window = OT_EXCLUDE_WINDOW) {
+  protospacer <- toupper(protospacer)
+  pam_index <- pam_data$index
+  proto_dna <- pam_data$proto_dna
+  qchars <- strsplit(protospacer, "")[[1]]
+  qseed  <- substr(protospacer, 10, 20)
+
+  # Candidate rows = union of (<=max_mismatch full match) and (exact seed match).
+  # Exclude anything within the on-target's own footprint (|pos - target| <=
+  # exclude_window): those are the on-target itself and its 1-bp-shifted frames,
+  # which share the seed at a frameshifted register and are not real off-targets.
+  query  <- Biostrings::DNAString(protospacer)
+  mm_hit <- Biostrings::vcountPattern(query, proto_dna, max.mismatch = max_mismatch,
+                                      min.mismatch = 0, with.indels = FALSE) > 0
+  seed_hit <- pam_index$seed == qseed
+  keep <- which((mm_hit | seed_hit) &
+                abs(pam_index$pam_position - target_position) > exclude_window)
+  if (length(keep) == 0) return(data.frame())
+
+  sub <- pam_index[keep, ]
+  protos <- sub$protospacer
+  mm <- vapply(protos, function(s) sum(strsplit(s, "")[[1]] != qchars), integer(1))
+  seedmatch <- substr(protos, 10, 20) == qseed
+
+  df <- data.frame(
+    type        = ifelse(mm <= max_mismatch, "mismatch", "seed-only"),
+    position    = sub$pam_position,
+    strand      = sub$strand,
+    mismatches  = mm,
+    seed_match  = seedmatch,
+    protospacer = protos,
+    stringsAsFactors = FALSE
+  )
+
+  # PAM as it reads on the guide strand (NGG)
+  if (!is.null(genome_seq)) {
+    gl <- nchar(genome_seq)
+    df$pam <- mapply(function(pos, st) {
+      if (pos < 1 || pos + 2 > gl) return(NA_character_)
+      tri <- substr(genome_seq, pos, pos + 2)
+      if (identical(st, "-")) reverse_complement(tri) else tri
+    }, df$position, df$strand, USE.NAMES = FALSE)
+  }
+
+  # Gene containing each off-target (genomic ranges)
+  if (!is.null(gene_metadata) && length(gene_metadata) > 0) {
+    gn <- names(gene_metadata)
+    gs <- vapply(gene_metadata, function(m) as.numeric(m$genomic_start), numeric(1))
+    ge <- vapply(gene_metadata, function(m) as.numeric(m$genomic_end), numeric(1))
+    df$gene <- vapply(df$position, function(p) {
+      hit <- which(gs <= p & ge >= p)
+      if (length(hit)) gn[hit[1]] else NA_character_
+    }, character(1))
+  }
+
+  df <- df[order(df$mismatches, !df$seed_match), , drop = FALSE]  # worst first
+  if (nrow(df) > max_report) df <- df[seq_len(max_report), , drop = FALSE]
+  rownames(df) <- NULL
+  df
 }

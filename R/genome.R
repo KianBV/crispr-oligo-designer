@@ -105,6 +105,50 @@ download_genome_features <- function(accession, force_download = FALSE) {
                  label = paste0("annotation (feature table) ", accession))
 }
 
+# ------------------------------------------------------------------------------
+# Initialised-system disk cache
+# ------------------------------------------------------------------------------
+# The expensive parts of init (PAM index ~46 s, codon usage, gene extraction) are
+# saved once per genome and reloaded in ~2-3 s on subsequent launches / strain
+# switches. Keyed by accession (strains) or a content hash (custom uploads).
+
+system_cache_key <- function(source) {
+  if (identical(source$type, "custom")) {
+    gkey <- tryCatch(unname(tools::md5sum(source$genome_file)), error = function(e) NA_character_)
+    if (is.na(gkey)) return(NULL)
+    akey <- if (!is.null(source$gff_file) && file.exists(source$gff_file)) {
+      tryCatch(unname(tools::md5sum(source$gff_file)), error = function(e) "")
+    } else ""
+    paste0("custom_", substr(gkey, 1, 12), if (nzchar(akey)) paste0("_", substr(akey, 1, 8)) else "")
+  } else {
+    source$accession
+  }
+}
+
+system_cache_path <- function(source) {
+  key <- system_cache_key(source)
+  if (is.null(key)) return(NULL)
+  ensure_cache_dir()
+  file.path(GENOME_CACHE_DIR, paste0(key, ".system.rds"))
+}
+
+load_cached_system <- function(source) {
+  p <- system_cache_path(source)
+  if (is.null(p) || !file.exists(p)) return(NULL)
+  obj <- tryCatch(readRDS(p), error = function(e) NULL)
+  if (is.null(obj) || !is.list(obj) ||
+      !identical(obj$cache_version, SYSTEM_CACHE_VERSION)) return(NULL)
+  obj
+}
+
+save_cached_system <- function(system, source) {
+  p <- system_cache_path(source)
+  if (is.null(p)) return(invisible(FALSE))
+  system$cache_version <- SYSTEM_CACHE_VERSION
+  ok <- tryCatch({ saveRDS(system, p); TRUE }, error = function(e) FALSE)
+  invisible(ok)
+}
+
 # Load annotations from a user-supplied GFF/GTF file. `format` (e.g. "gff3",
 # "gtf") is passed to rtracklayer because the uploaded temp file may not keep a
 # meaningful extension.
@@ -328,16 +372,19 @@ resolve_gene_id <- function(id, id_maps, id_type = "gene") {
 compute_codon_usage <- function(gene_sequences) {
   cat("Computing codon usage from", length(gene_sequences), "coding sequences...\n")
 
-  all_codons <- character(0)
-  for (seq in gene_sequences) {
-    seq <- toupper(seq)
+  # Collect codons per gene into a pre-allocated list, then unlist once.
+  # (Growing a vector with c() inside the loop is O(n^2) and was the dominant
+  #  cost of initialisation; this is ~constant-factor faster.)
+  per_gene <- vector("list", length(gene_sequences))
+  for (i in seq_along(gene_sequences)) {
+    seq <- toupper(gene_sequences[[i]])
     n_codons <- nchar(seq) %/% 3
     if (n_codons < 1) next
     starts <- seq(1, n_codons * 3, by = 3)
     ends <- seq(3, n_codons * 3, by = 3)
-    codons <- substring(seq, starts, ends)
-    all_codons <- c(all_codons, codons)
+    per_gene[[i]] <- substring(seq, starts, ends)
   }
+  all_codons <- unlist(per_gene, use.names = FALSE)
 
   # Raw counts
   codon_counts <- table(factor(all_codons, levels = names(REVERSE_CODON_TABLE)))

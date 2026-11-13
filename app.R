@@ -8,7 +8,8 @@
 
 # --- Load backend modules (order matters for top-level definitions) -----------
 .backend_files <- c("packages.R", "constants.R", "config.R", "genome.R",
-                    "offtarget.R", "design.R", "microsynth.R", "pipeline.R")
+                    "offtarget.R", "design.R", "microsynth.R", "qc.R",
+                    "genome_view.R", "pipeline.R")
 for (.f in .backend_files) source(file.path("R", .f))
 
 load_gui_packages()
@@ -103,6 +104,18 @@ ui <- bslib::page_sidebar(
         shiny::numericInput("n_cores", "CPU cores",
                             value = CFG0$design$n_cores, min = 1, max = 16, step = 1),
         shiny::hr(),
+        shiny::strong("Scoring (A/B toggles)"),
+        shiny::p(shiny::tags$small("Off by default = original model. See SCORING.md.")),
+        shiny::checkboxInput("score_swap23",
+                             "Rank exact seed-match (class 3) above class 2",
+                             value = isTRUE(CFG0$design$scoring$swap_class_2_3)),
+        shiny::numericInput("score_ot_weight", "Off-target count penalty weight (0 = off)",
+                            value = CFG0$design$scoring$offtarget_count_weight,
+                            min = 0, max = 3, step = 0.1),
+        shiny::checkboxInput("score_activity",
+                             "On-target activity penalty (GC band + homopolymer)",
+                             value = isTRUE(CFG0$design$scoring$activity_term)),
+        shiny::hr(),
         shiny::strong("Order form (top-ranked)"),
         shiny::numericInput("export_min_score", "Min score for order form",
                             value = CFG0$export$min_score_filter, min = 0, max = 5, step = 0.1),
@@ -110,10 +123,33 @@ ui <- bslib::page_sidebar(
                          value = ""),
         shiny::numericInput("pto_n_bases", "PTO-protected 5' bases (homology arm)",
                             value = CFG0$microsynth$pto_n_bases, min = 0, max = 10, step = 1),
-        shiny::textInput("fwd_tail", "Forward gRNA primer 3' tail (Gibson)",
-                         value = CFG0$microsynth$fwd_tail),
-        shiny::textInput("rev_tail", "Reverse gRNA primer 3' tail (Gibson)",
-                         value = CFG0$microsynth$rev_tail),
+        shiny::hr(),
+        shiny::strong("gRNA cloning oligos"),
+        shiny::radioButtons("cloning_method", "Cloning method",
+                            choices = c("Gibson (whole-plasmid PCR)" = "gibson",
+                                        "Golden Gate (BsaI, annealed pair)" = "golden_gate",
+                                        "Both" = "both"),
+                            selected = CFG0$microsynth$cloning_method),
+        shiny::conditionalPanel(
+          condition = "input.cloning_method == 'gibson' || input.cloning_method == 'both'",
+          shiny::textInput("fwd_tail", "Gibson forward 3' tail",
+                           value = CFG0$microsynth$fwd_tail),
+          shiny::textInput("rev_tail", "Gibson reverse 3' tail",
+                           value = CFG0$microsynth$rev_tail)
+        ),
+        shiny::conditionalPanel(
+          condition = "input.cloning_method == 'golden_gate' || input.cloning_method == 'both'",
+          shiny::textInput("gg_top_overhang", "Golden Gate top overhang (4 nt)",
+                           value = CFG0$microsynth$gg_top_overhang),
+          shiny::textInput("gg_bot_overhang", "Golden Gate bottom overhang (4 nt)",
+                           value = CFG0$microsynth$gg_bot_overhang),
+          shiny::checkboxInput("gg_phosphorylate", "Order Golden Gate oligos 5'-phosphorylated",
+                               value = isTRUE(CFG0$microsynth$gg_phosphorylate))
+        ),
+        shiny::hr(),
+        shiny::strong("QC (Tm / GC / hairpins)"),
+        shiny::numericInput("qc_na_mM", "Monovalent cation for Tm (mM)",
+                            value = CFG0$qc$na_mM, min = 1, max = 1000, step = 1),
         shiny::fileInput("template_file", "Microsynth template (.xlsx) — optional override",
                          accept = ".xlsx")
       )
@@ -143,6 +179,8 @@ ui <- bslib::page_sidebar(
         shiny::downloadButton("dl_all", "Download all designs CSV",
                               class = "btn-outline-secondary btn-sm")
       ),
+      shiny::p(shiny::tags$small(shiny::icon("hand-pointer"),
+               " Click a row to inspect it (genomic map, sequence, off-targets).")),
       DT::DTOutput("results_table")
     ),
 
@@ -157,6 +195,37 @@ ui <- bslib::page_sidebar(
                               class = "btn-outline-secondary")
       ),
       DT::DTOutput("oligo_table")
+    ),
+
+    bslib::nav_panel(
+      "QC", icon = shiny::icon("flask"),
+      shiny::uiOutput("qc_summary"),
+      shiny::div(class = "mb-2",
+        shiny::downloadButton("dl_qc", "Download QC CSV",
+                              class = "btn-outline-secondary btn-sm")),
+      shiny::uiOutput("qc_backend_note"),
+      DT::DTOutput("qc_table_out")
+    ),
+
+    bslib::nav_panel(
+      "Inspector", icon = shiny::icon("magnifying-glass-chart"),
+      shiny::uiOutput("inspector_header"),
+      shiny::conditionalPanel(
+        condition = "output.inspector_ready == true",
+        bslib::card(
+          bslib::card_header("Alignment map (wild type vs edit)"),
+          shiny::plotOutput("inspector_map", height = "300px")
+        ),
+        bslib::card(
+          bslib::card_header("Sequence & components"),
+          shiny::uiOutput("inspector_seq")
+        ),
+        bslib::card(
+          bslib::card_header(shiny::uiOutput("inspector_ot_header")),
+          shiny::uiOutput("inspector_ot_align"),
+          DT::DTOutput("inspector_offtargets")
+        )
+      )
     ),
 
     bslib::nav_panel(
@@ -194,11 +263,21 @@ server <- function(input, output, session) {
     cfg$design$min_score_threshold <- input$min_score_threshold
     cfg$design$top_n               <- input$top_n
     cfg$design$n_cores             <- input$n_cores
+    cfg$design$scoring <- modifyList(CFG0$design$scoring %||% list(), list(
+      swap_class_2_3         = isTRUE(input$score_swap23),
+      offtarget_count_weight = input$score_ot_weight %||% 0,
+      activity_term          = isTRUE(input$score_activity)
+    ))
     cfg$export$min_score_filter    <- input$export_min_score
     cfg$microsynth$pto_n_bases     <- input$pto_n_bases
+    cfg$microsynth$cloning_method  <- input$cloning_method %||% CFG0$microsynth$cloning_method
     # Tails kept verbatim (lowercase convention marks the vector-homology region)
-    cfg$microsynth$fwd_tail        <- trimws(input$fwd_tail)
-    cfg$microsynth$rev_tail        <- trimws(input$rev_tail)
+    cfg$microsynth$fwd_tail        <- trimws(input$fwd_tail %||% CFG0$microsynth$fwd_tail)
+    cfg$microsynth$rev_tail        <- trimws(input$rev_tail %||% CFG0$microsynth$rev_tail)
+    cfg$microsynth$gg_top_overhang <- toupper(trimws(input$gg_top_overhang %||% CFG0$microsynth$gg_top_overhang))
+    cfg$microsynth$gg_bot_overhang <- toupper(trimws(input$gg_bot_overhang %||% CFG0$microsynth$gg_bot_overhang))
+    cfg$microsynth$gg_phosphorylate <- isTRUE(input$gg_phosphorylate)
+    cfg$qc$na_mM                   <- input$qc_na_mM %||% CFG0$qc$na_mM
     if (!is.null(input$template_file)) {
       cfg$microsynth$template_path <- input$template_file$datapath
     }
@@ -447,12 +526,28 @@ server <- function(input, output, session) {
   })
 
   # ==== Results ==============================================================
-  output$results_table <- DT::renderDT({
+  results_view_df <- shiny::reactive({
     shiny::req(rv$results_all)
-    df <- if (input$results_view == "top") rv$results_top else rv$results_all
+    if (input$results_view == "top") rv$results_top else rv$results_all
+  })
+
+  output$results_table <- DT::renderDT({
+    df <- results_view_df()
     shiny::validate(shiny::need(!is.null(df) && nrow(df) > 0, "No rows for the current filter."))
-    DT::datatable(df, filter = "top", rownames = FALSE,
+    DT::datatable(df, filter = "top", rownames = FALSE, selection = "single",
                   options = list(pageLength = 15, scrollX = TRUE))
+  })
+
+  # The design row currently selected in the Results table (for the Inspector)
+  selected_design <- shiny::reactive({
+    sel <- input$results_table_rows_selected
+    df <- results_view_df()
+    if (is.null(sel) || length(sel) == 0 || is.null(df) || nrow(df) == 0) return(NULL)
+    df[sel[1], , drop = FALSE]
+  })
+
+  shiny::observeEvent(input$results_table_rows_selected, {
+    if (length(input$results_table_rows_selected)) bslib::nav_select("main_tabs", "Inspector")
   })
 
   output$dl_all <- shiny::downloadHandler(
@@ -467,14 +562,15 @@ server <- function(input, output, session) {
   # ==== Order form ===========================================================
   oligo_orders <- shiny::reactive({
     shiny::req(rv$results_top)
+    build_oligo_orders(rv$results_top, effective_cfg())
+  })
+
+  # QC of the current oligo set
+  oligo_qc <- shiny::reactive({
+    shiny::req(rv$results_top)
     cfg <- effective_cfg()
-    generate_oligo_orders(rv$results_top,
-                          fwd_tail        = cfg$microsynth$fwd_tail,
-                          rev_tail        = cfg$microsynth$rev_tail,
-                          n_pto_bases     = cfg$microsynth$pto_n_bases,
-                          fwd_name_suffix = cfg$microsynth$fwd_name_suffix,
-                          rev_name_suffix = cfg$microsynth$rev_name_suffix,
-                          ha_name_suffix  = cfg$microsynth$ha_name_suffix)
+    qc_table(oligo_orders()$oligos, cfg$qc,
+             ha_suffix = cfg$microsynth$ha_name_suffix %||% "_HA")
   })
 
   output$order_summary <- shiny::renderUI({
@@ -520,6 +616,111 @@ server <- function(input, output, session) {
       )
     }
   )
+
+  # ==== QC ===================================================================
+  output$qc_summary <- shiny::renderUI({
+    if (is.null(rv$results_top) || nrow(rv$results_top) == 0)
+      return(shiny::p("Run the pipeline first — QC is computed on the ordered oligos."))
+    q <- oligo_qc()
+    n_flag <- sum(nzchar(q$flags))
+    bslib::layout_columns(
+      col_widths = c(3, 3, 3, 3),
+      bslib::value_box("Oligos", nrow(q), theme = "primary"),
+      bslib::value_box("Flagged", n_flag, theme = if (n_flag > 0) "warning" else "success"),
+      bslib::value_box("Hairpin ≥ thr",
+                       sum(q$hairpin_stem >= (effective_cfg()$qc$hairpin_stem %||% 6)),
+                       theme = "secondary"),
+      bslib::value_box("BsaI sites",
+                       if ("BsaI_site" %in% names(q)) sum(q$BsaI_site) else 0,
+                       theme = if (("BsaI_site" %in% names(q)) && any(q$BsaI_site)) "danger" else "success")
+    )
+  })
+
+  output$qc_backend_note <- shiny::renderUI({
+    q <- oligo_qc()
+    p3 <- "tm_method" %in% names(q) && any(q$tm_method == "primer3")
+    if (p3) {
+      shiny::p(shiny::tags$small(
+        shiny::icon("circle-check"), " Thermodynamics: ", shiny::strong("primer3"),
+        " — Tm, hairpin & self-dimer are true ΔG (kcal/mol)."))
+    } else {
+      shiny::p(shiny::tags$small(
+        shiny::icon("circle"), " Thermodynamics: ", shiny::strong("built-in heuristic"),
+        " (Tm = nearest-neighbor; hairpin/3'-dimer are stem lengths in bp, not ΔG). ",
+        "Run ", shiny::code("pip install primer3-py"), " for accurate ΔG."))
+    }
+  })
+
+  output$qc_table_out <- DT::renderDT({
+    q <- oligo_qc()
+    shiny::validate(shiny::need(nrow(q) > 0, "No oligos to QC."))
+    dt <- DT::datatable(q, filter = "top", rownames = FALSE,
+                        options = list(pageLength = 15, scrollX = TRUE))
+    # highlight flagged rows
+    DT::formatStyle(dt, "flags", target = "row",
+                    backgroundColor = DT::styleEqual("", "white", default = "#fff3cd"))
+  })
+
+  output$dl_qc <- shiny::downloadHandler(
+    filename = function() paste0("oligo_qc_", Sys.Date(), ".csv"),
+    content = function(file) utils::write.csv(oligo_qc(), file, row.names = FALSE)
+  )
+
+  # ==== Inspector (select a design in Results) ===============================
+  output$inspector_ready <- shiny::reactive(!is.null(selected_design()))
+  shiny::outputOptions(output, "inspector_ready", suspendWhenHidden = FALSE)
+
+  output$inspector_header <- shiny::renderUI({
+    d <- selected_design()
+    if (is.null(d)) {
+      return(shiny::p("Select a design row in the ", shiny::strong("Results"),
+                      " tab to inspect it — genomic map, sequence, and off-targets."))
+    }
+    shiny::h5(sprintf("%s  —  %s→%s in %s  (rank %s, score %s, gRNA on %s strand)",
+                      d$mutation, d$original_codon, d$mutant_codon, d$gene, d$rank,
+                      d$score, if (identical(d$strand, "+")) "+" else "−"))
+  })
+
+  inspector_offtargets <- shiny::reactive({
+    d <- selected_design(); shiny::req(d, rv$system)
+    tryCatch(design_off_targets(d, rv$system), error = function(e) data.frame())
+  })
+
+  output$inspector_map <- shiny::renderPlot({
+    d <- selected_design(); shiny::req(d, rv$system)
+    render_design_ggmap(d, rv$system)
+  })
+
+  output$inspector_seq <- shiny::renderUI({
+    d <- selected_design(); shiny::req(d, rv$system)
+    shiny::HTML(design_sequence_html(d, rv$system))
+  })
+
+  output$inspector_ot_header <- shiny::renderUI({
+    ot <- inspector_offtargets()
+    n <- if (is.null(ot)) 0 else nrow(ot)
+    paste0("Off-target sites (", n, ")")
+  })
+
+  output$inspector_offtargets <- DT::renderDT({
+    ot <- inspector_offtargets()
+    shiny::validate(shiny::need(!is.null(ot) && nrow(ot) > 0,
+                                "No off-target sites (≤4 mismatches or shared seed)."))
+    DT::datatable(ot, rownames = FALSE, filter = "top", selection = "single",
+                  options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+  output$inspector_ot_align <- shiny::renderUI({
+    ot <- inspector_offtargets(); d <- selected_design()
+    if (is.null(ot) || nrow(ot) == 0 || is.null(d)) return(NULL)
+    sel <- input$inspector_offtargets_rows_selected
+    if (is.null(sel) || length(sel) == 0) {
+      return(shiny::p(shiny::tags$small(shiny::icon("hand-pointer"),
+                      " Click an off-target row to align it to the guide (mismatches in red).")))
+    }
+    shiny::div(class = "mb-3 p-2", style = "background:#f8f9fa;border-radius:6px",
+               shiny::HTML(offtarget_alignment_html(d$protospacer, ot[sel[1], , drop = FALSE])))
+  })
 
   # ==== Summary ==============================================================
   output$summary_text <- shiny::renderText({
@@ -576,7 +777,24 @@ server <- function(input, output, session) {
        <h4>Oligo size</h4>
        <p>The <b>Microsynth oligo size</b> (Settings) sets the homology-arm repair
           oligo length; default 100 bp. It is also configurable in
-          <code>config/config.yml</code>.</p>")
+          <code>config/config.yml</code>.</p>
+       <h4>Cloning method</h4>
+       <p>Under <b>Settings &rarr; gRNA cloning oligos</b> choose how the spacer is
+          delivered: <b>Gibson</b> (whole-plasmid PCR primers,
+          <code>_fw_gibson</code>/<code>_rv_gibson</code>), <b>Golden Gate</b> (an
+          annealed oligo pair <code>_gg_bsaI_top</code>/<code>_bot</code> with 4-nt
+          BsaI fusion overhangs, default <code>TAGT</code>/<code>AAAC</code>, optionally
+          5'-phosphorylated), or <b>Both</b>. The <code>_HA</code> repair donor is
+          always included.</p>
+       <h4>QC tab</h4>
+       <p>Every ordered oligo is checked for GC%, nearest-neighbor Tm, longest
+          hairpin stem, 3'-end self-dimer, homopolymer runs, and internal
+          <b>BsaI/BbsI</b> sites (a BsaI site in the spacer breaks Golden Gate
+          assembly). Flagged oligos are highlighted; thresholds are in
+          <code>config/config.yml &rarr; qc</code>. With <code>primer3-py</code> installed
+          (<code>pip install primer3-py</code>) the hairpin/dimer values are true
+          thermodynamic &Delta;G; otherwise they are heuristic stem lengths. The QC tab
+          shows which backend is active.</p>")
   })
 }
 

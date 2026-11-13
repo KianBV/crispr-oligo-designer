@@ -5,9 +5,11 @@
 #   Rscript install.R
 # ==============================================================================
 
-cran_packages <- c("shiny", "DT", "shinyjs", "bslib",
+cran_packages <- c("shiny", "DT", "shinyjs", "bslib", "ggplot2",
                    "dplyr", "stringr", "data.table", "openxlsx", "yaml")
 bioc_packages <- c("Biostrings", "GenomicFeatures", "rtracklayer")
+# The design inspector's alignment map uses ggplot2 (above). Gviz is an optional
+# alternative engine (render_design_view in R/genome_view.R) and is NOT required.
 
 message("== Installing CRAN packages ==")
 installed <- rownames(installed.packages())
@@ -35,4 +37,19 @@ missing <- setdiff(c(cran_packages, bioc_packages), rownames(installed.packages(
 if (length(missing) > 0) {
   stop("These packages failed to install: ", paste(missing, collapse = ", "))
 }
-message("\nAll dependencies installed. Launch the app with:  Rscript run.R")
+message("\nAll core R dependencies installed. Launch the app with:  Rscript run.R")
+
+# Optional: accurate thermodynamic QC (hairpin / dimer Delta-G) via primer3-py.
+# The app works without it (falls back to built-in heuristics), but for true
+# Delta-G install the Python package:
+message("\nOptional, for accurate oligo QC (true hairpin/dimer Delta-G):")
+message("    pip install primer3-py      (needs Python on PATH)")
+py <- Sys.which("python")
+if (nzchar(py)) {
+  ok <- tryCatch(system2(py, c("-c", "import primer3"), stdout = FALSE, stderr = FALSE) == 0,
+                 error = function(e) FALSE)
+  message(if (isTRUE(ok)) "  -> primer3-py detected: accurate QC is ON."
+          else "  -> primer3-py not found yet (QC will use the built-in heuristic).")
+} else {
+  message("  -> Python not on PATH; QC will use the built-in heuristic.")
+}

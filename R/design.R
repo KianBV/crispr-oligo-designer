@@ -46,10 +46,62 @@ parse_mutation <- function(mutation_string) {
   NULL
 }
 
-calculate_cassette_score <- function(distance, off_target_class, num_substitutions = 5) {
-  base_scores <- c(5.0, 4.41, 3.9, 2.0)
-  distance_steps <- floor(min(distance, 30) / 3)
-  score <- base_scores[off_target_class] - (distance_steps * 0.2)
+# On-target activity penalty: GC outside the ideal band + long homopolymer runs.
+# Self-contained (same GC/homopolymer logic as the QC module) so the core
+# pipeline has no cross-file dependency.
+activity_penalty <- function(protospacer, s = SCORING) {
+  seqU <- toupper(protospacer)
+  pen <- 0
+  chars <- strsplit(seqU, "")[[1]]
+  gc <- if (length(chars)) sum(chars %in% c("G", "C")) / length(chars) else NA_real_
+  if (!is.na(gc) && (gc < s$gc_ideal_min || gc > s$gc_ideal_max)) pen <- pen + s$gc_penalty
+  runs <- nchar(unlist(regmatches(seqU, gregexpr("(.)\\1*", seqU))))
+  hp <- if (length(runs)) max(runs) else 0L
+  if (hp > s$homopolymer_max) pen <- pen + s$homopolymer_penalty
+  pen
+}
+
+#' Cassette score for a gRNA candidate (see SCORING.md).
+#'
+#' score = base[class] - distance_penalty - offtarget_penalty - activity_penalty
+#'
+#' With SCORING_DEFAULTS this is exactly the original model
+#' (base[class] - 0.2*floor(min(distance,30)/3)); the magnitude and activity
+#' terms are off and class 2/3 are not swapped.
+#'
+#' @param distance PAM-to-edit distance (bp)
+#' @param off_target_class 1..4 from count_off_targets_fast()
+#' @param off_target_count number of <=4-mismatch off-targets (magnitude term)
+#' @param seed_matches number of exact-seed matches elsewhere (magnitude term)
+#' @param protospacer spacer sequence (activity term); NULL to skip
+#' @param scoring scoring config list (defaults to the global SCORING)
+calculate_cassette_score <- function(distance, off_target_class,
+                                     off_target_count = 0, seed_matches = 0,
+                                     protospacer = NULL, scoring = SCORING) {
+  s <- scoring %||% SCORING_DEFAULTS
+
+  # --- base score per off-target class (optionally swap class 2 <-> 3) ---
+  base <- s$base_scores
+  if (isTRUE(s$swap_class_2_3) && length(base) >= 3) {
+    tmp <- base[2]; base[2] <- base[3]; base[3] <- tmp
+  }
+  score <- base[off_target_class]
+
+  # --- distance penalty ---
+  steps <- floor(min(distance, s$distance_cap_bp) / s$distance_step_bp)
+  score <- score - steps * s$distance_penalty_per_step
+
+  # --- off-target magnitude penalty (log scale), 0 weight = off ---
+  w <- s$offtarget_count_weight %||% 0
+  if (w > 0) {
+    mag <- (off_target_count %||% 0) + (seed_matches %||% 0)
+    score <- score - w * log1p(mag)
+  }
+
+  # --- on-target activity penalty (GC + homopolymer) ---
+  if (isTRUE(s$activity_term) && !is.null(protospacer)) {
+    score <- score - activity_penalty(protospacer, s)
+  }
 
   max(score, 0)
 }
@@ -198,7 +250,10 @@ design_grna_for_mutation_fast <- function(gene_sequence, mutation, gene_genomic_
                 ot_result <- list(off_target_class = 1, seed_matches = 0, off_target_count = 0)
               }
 
-              score <- calculate_cassette_score(distance, ot_result$off_target_class)
+              score <- calculate_cassette_score(distance, ot_result$off_target_class,
+                                                   off_target_count = ot_result$off_target_count,
+                                                   seed_matches = ot_result$seed_matches,
+                                                   protospacer = protospacer)
 
               if (score >= MIN_SCORE_THRESHOLD) {
                 candidates[[length(candidates) + 1]] <- list(
@@ -245,7 +300,10 @@ design_grna_for_mutation_fast <- function(gene_sequence, mutation, gene_genomic_
                 ot_result <- list(off_target_class = 1, seed_matches = 0, off_target_count = 0)
               }
 
-              score <- calculate_cassette_score(distance, ot_result$off_target_class)
+              score <- calculate_cassette_score(distance, ot_result$off_target_class,
+                                                   off_target_count = ot_result$off_target_count,
+                                                   seed_matches = ot_result$seed_matches,
+                                                   protospacer = protospacer)
 
               if (score >= MIN_SCORE_THRESHOLD) {
                 candidates[[length(candidates) + 1]] <- list(
@@ -375,17 +433,47 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
                                              gene_meta$genomic_start, gene_meta$strand)
       oligo <- generate_200bp_oligo(design, homology_arm)
 
+      # Gene-local coordinates of the designed elements (for the genome view)
+      pamp <- design$pam_position
+      if (identical(design$strand, "+")) {
+        proto_start <- pamp - 20; proto_end <- pamp - 1
+      } else {
+        proto_start <- pamp + 3;  proto_end <- pamp + 22
+      }
+
+      # Displayed off-target count = exactly what the inspector lists. Recompute
+      # via the same enumerator (find_off_targets) for the handful of top picks so
+      # the Results column can never disagree with the inspector's off-target table
+      # (count_off_targets_fast and find_off_targets can differ by seed-only /
+      # exact-duplicate edge cases; the enumeration is authoritative).
+      ot_count <- design$off_target_count
+      if (!is.null(pam_data)) {
+        tgen <- gene_local_to_genomic(pamp, gene_genomic_start, gene_genomic_end, gene_strand)
+        ot_hits <- tryCatch(find_off_targets(design$protospacer, pam_data, tgen),
+                            error = function(e) NULL)
+        if (!is.null(ot_hits)) ot_count <- nrow(ot_hits)
+      }
+
       data.frame(
         mutation = mut_str, gene = mutation$gene, position = mutation$position,
         wt_aa = mutation$wt_aa, mut_aa = mutation$mut_aa, rank = i,
         score = round(design$score, 3), off_target_class = design$off_target_class,
-        seed_matches = design$seed_matches, off_target_count = design$off_target_count,
+        seed_matches = design$seed_matches, off_target_count = ot_count,
         pam_distance = design$distance, strand = design$strand,
         protospacer = design$protospacer, original_codon = design$original_codon,
         mutant_codon = design$mutant_codon, pam_mutation = design$pam_mutation$codon_change,
         pam_mutation_freq_diff = design$pam_mutation$freq_diff,
         homology_arm = homology_arm$sequence, oligo_200bp = oligo$oligo_sequence,
-        oligo_length = oligo$length, stringsAsFactors = FALSE
+        oligo_length = oligo$length,
+        # --- gene-local coordinates for the design inspector / genome view ---
+        codon_start = design$codon_start, pam_position = pamp,
+        proto_start = proto_start, proto_end = proto_end,
+        ha_start = homology_arm$start, ha_end = homology_arm$end,
+        silent_mut_pos = design$pam_mutation$position,
+        gene_genomic_start = gene_meta$genomic_start,
+        gene_genomic_end = gene_meta$genomic_end,
+        gene_strand = gene_meta$strand,
+        stringsAsFactors = FALSE
       )
     })
 
@@ -422,11 +510,13 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
       parallel::clusterExport(cl, c("parse_mutation", "resolve_gene_id",
                                     "design_grna_for_mutation_fast",
                                     "generate_homology_arm", "generate_200bp_oligo",
-                                    "count_off_targets_fast", "generate_silent_pam_mutations",
-                                    "calculate_cassette_score", "get_codons_for_aa",
+                                    "count_off_targets_fast", "find_off_targets",
+                                    "OT_EXCLUDE_WINDOW", "generate_silent_pam_mutations",
+                                    "calculate_cassette_score", "activity_penalty", "get_codons_for_aa",
                                     "translate_codon", "reverse_complement",
                                     "gene_local_to_genomic",
                                     "CODON_TABLE", "REVERSE_CODON_TABLE", "ECOLI_CODON_FREQ",
+                                    "SCORING", "SCORING_DEFAULTS",
                                     "MAX_PAM_DISTANCE", "HOMOLOGY_ARM_LENGTH",
                                     "MIN_SCORE_THRESHOLD", "MAX_MISMATCHES",
                                     "SPACER1", "SPACER2", "J23119_PROMOTER", "SGRNA_HANDLE", "%||%"),
@@ -461,10 +551,12 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
 #' @param source a genome source list from strain_source()/custom_source().
 #'   For backward compatibility, a bare accession string or NULL (= default
 #'   strain) is also accepted.
-#' @param force_download re-download cached NCBI genomes/annotations
+#' @param force_download re-download cached NCBI genomes/annotations and rebuild
+#'   the cached system (ignore any <key>.system.rds).
+#' @param use_cache load/save the initialised-system disk cache (default TRUE)
 #' @param progress_callback optional function(fraction, message) for the GUI
 initialize_system_fast <- function(source = NULL, force_download = FALSE,
-                                    progress_callback = NULL) {
+                                    use_cache = TRUE, progress_callback = NULL) {
   # Normalise the source argument
   if (is.null(source)) {
     source <- strain_source(DEFAULT_GENOME_ACCESSION, "BW25113 (default)")
@@ -474,6 +566,18 @@ initialize_system_fast <- function(source = NULL, force_download = FALSE,
 
   cat("\n=== Initializing System (Fast Version) ===\n\n")
   cat("Genome source:", source$name, "\n")
+
+  # Fast path: reuse a cached, fully-built system (skips the ~100 s build)
+  if (isTRUE(use_cache) && !isTRUE(force_download)) {
+    cached <- load_cached_system(source)
+    if (!is.null(cached)) {
+      cat("Loaded cached system (", length(cached$gene_sequences), "genes).\n")
+      cached$genome_name <- source$name
+      if (!is.null(progress_callback)) progress_callback(1.0, "Loaded cached genome.")
+      return(cached)
+    }
+  }
+
   if (!is.null(progress_callback)) progress_callback(0.05, "Loading genome...")
 
   empty_gene_data <- list(sequences = list(), metadata = list(), id_maps = list(),
@@ -534,9 +638,8 @@ initialize_system_fast <- function(source = NULL, force_download = FALSE,
   }
 
   cat("\nSystem ready!\n")
-  if (!is.null(progress_callback)) progress_callback(1.0, "Genome ready.")
 
-  list(
+  system <- list(
     genome = genome,
     genome_seq = genome_seq,
     genome_name = source$name,
@@ -547,4 +650,13 @@ initialize_system_fast <- function(source = NULL, force_download = FALSE,
     id_types = gene_data$id_types,
     codon_freq = codon_freq
   )
+
+  # Cache the fully-built system so the next load of this genome is near-instant
+  if (isTRUE(use_cache)) {
+    if (!is.null(progress_callback)) progress_callback(0.97, "Caching system...")
+    if (isTRUE(save_cached_system(system, source))) cat("Cached system for fast re-loading.\n")
+  }
+  if (!is.null(progress_callback)) progress_callback(1.0, "Genome ready.")
+
+  system
 }
