@@ -220,6 +220,19 @@ offtarget_alignment_html <- function(guide, ot_row) {
     botc[i] <- cell(o[i], mm, "9px")
     midc[i] <- if (mm) "<span>&nbsp;</span>" else "<span style='color:#9fb6c7'>|</span>"
   }
+
+  # Append the PAM (3' of the protospacer) as a bold, boxed codon so it stands
+  # out: the off-target's actual PAM on the OT row, the required NGG motif on the
+  # guide row. A small gap separates it from the 20-nt spacer, SnapGene-style.
+  ot_pam <- toupper(ot_row$pam %||% "NGG")
+  pam_box <- function(txt, col) sprintf(
+    paste0("<span style='display:inline-block;margin-left:10px;padding:0 4px;",
+           "border:1.5px solid %s;border-radius:4px;color:%s;font-weight:800;",
+           "letter-spacing:1px'>%s</span>"), col, col, txt)
+  topc <- c(topc, pam_box("NGG", "#8a8a8a"))
+  botc <- c(botc, pam_box(ot_pam, "#D95F0E"))
+  midc <- c(midc, sprintf(
+    "<span style='display:inline-block;margin-left:10px;color:#aaa;font-weight:700'>PAM</span>"))
   # Fixed-width label column (flex) so both sequences start at the SAME x,
   # regardless of label text width.
   row <- function(lead, cells) paste0(

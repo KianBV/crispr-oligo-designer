@@ -441,11 +441,24 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
         proto_start <- pamp + 3;  proto_end <- pamp + 22
       }
 
+      # Displayed off-target count = exactly what the inspector lists. Recompute
+      # via the same enumerator (find_off_targets) for the handful of top picks so
+      # the Results column can never disagree with the inspector's off-target table
+      # (count_off_targets_fast and find_off_targets can differ by seed-only /
+      # exact-duplicate edge cases; the enumeration is authoritative).
+      ot_count <- design$off_target_count
+      if (!is.null(pam_data)) {
+        tgen <- gene_local_to_genomic(pamp, gene_genomic_start, gene_genomic_end, gene_strand)
+        ot_hits <- tryCatch(find_off_targets(design$protospacer, pam_data, tgen),
+                            error = function(e) NULL)
+        if (!is.null(ot_hits)) ot_count <- nrow(ot_hits)
+      }
+
       data.frame(
         mutation = mut_str, gene = mutation$gene, position = mutation$position,
         wt_aa = mutation$wt_aa, mut_aa = mutation$mut_aa, rank = i,
         score = round(design$score, 3), off_target_class = design$off_target_class,
-        seed_matches = design$seed_matches, off_target_count = design$off_target_count,
+        seed_matches = design$seed_matches, off_target_count = ot_count,
         pam_distance = design$distance, strand = design$strand,
         protospacer = design$protospacer, original_codon = design$original_codon,
         mutant_codon = design$mutant_codon, pam_mutation = design$pam_mutation$codon_change,
@@ -497,7 +510,8 @@ design_mutation_library_fast <- function(mutations, system, top_n = 3, n_cores =
       parallel::clusterExport(cl, c("parse_mutation", "resolve_gene_id",
                                     "design_grna_for_mutation_fast",
                                     "generate_homology_arm", "generate_200bp_oligo",
-                                    "count_off_targets_fast", "generate_silent_pam_mutations",
+                                    "count_off_targets_fast", "find_off_targets",
+                                    "OT_EXCLUDE_WINDOW", "generate_silent_pam_mutations",
                                     "calculate_cassette_score", "activity_penalty", "get_codons_for_aa",
                                     "translate_codon", "reverse_complement",
                                     "gene_local_to_genomic",

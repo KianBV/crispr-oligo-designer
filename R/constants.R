@@ -117,6 +117,12 @@ MAX_PAM_DISTANCE    <- 30   # max distance (bp) from PAM to target codon
 MIN_SCORE_THRESHOLD <- 3    # minimum cassette score to keep a candidate
 SEED_LENGTH         <- 11   # seed length for off-target seed matching
 MAX_MISMATCHES      <- 4    # max mismatches counted as off-target
+# Sites within +/- this many bp of the on-target PAM are the on-target itself and
+# its 1-bp-shifted (frameshifted) registers, which spuriously share the seed/match
+# at a shifted position. They are NOT real off-targets and are excluded from BOTH
+# the off-target count used for scoring/display AND the inspector enumeration, so
+# the two always agree. (protospacer 20 + PAM 3 = 23.)
+OT_EXCLUDE_WINDOW   <- 23
 
 # ------------------------------------------------------------------------------
 # Scoring model (see SCORING.md). The DEFAULTS below reproduce the original
