@@ -52,7 +52,7 @@ microsynth:
   sheet: "DNA Order"
 
   # Which gRNA cloning oligos to emit: "gibson", "golden_gate" or "both".
-  cloning_method: "gibson"
+  cloning_method: "golden_gate"
 
   # --- Gibson primers ---
   # gRNA Gibson-assembly primer 3' homology tails. Each primer is

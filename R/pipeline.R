@@ -154,7 +154,7 @@ build_oligo_orders <- function(results_top, cfg) {
   m <- cfg$microsynth
   generate_oligo_orders(
     results_top,
-    method          = m$cloning_method  %||% "gibson",
+    method          = m$cloning_method  %||% "golden_gate",
     fwd_tail        = m$fwd_tail        %||% GRNA_FWD_TAIL,
     rev_tail        = m$rev_tail        %||% GRNA_REV_TAIL,
     gg_top_overhang = m$gg_top_overhang %||% GG_TOP_OVERHANG,
@@ -244,7 +244,7 @@ build_run_summary <- function(validation_df, results_all, results_top, cfg,
   add("Max PAM distance:          ", cfg$design$max_pam_distance, " bp")
   add("Min score threshold:       ", cfg$design$min_score_threshold)
   add("Designs per mutation:      ", cfg$design$top_n)
-  add("Cloning method:            ", cfg$microsynth$cloning_method %||% "gibson")
+  add("Cloning method:            ", cfg$microsynth$cloning_method %||% "golden_gate")
   add("")
   add("--- Results ---")
   n_designs <- if (!is.null(results_all)) nrow(results_all) else 0

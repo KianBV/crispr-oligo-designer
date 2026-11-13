@@ -29,7 +29,7 @@ default_config <- function() {
       template_path   = "templates/MicrosynthUploadFormDNA__2_.xlsx",
       sheet           = "DNA Order",
       # Which gRNA cloning oligos to emit: "gibson", "golden_gate" or "both".
-      cloning_method  = "gibson",
+      cloning_method  = "golden_gate",
       # gRNA Gibson primer 3' homology tails (appended after the protospacer)
       fwd_tail        = "gttttagagctagaaatagcaagt",
       rev_tail        = "actagtattatacctaggactgag",

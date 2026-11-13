@@ -48,7 +48,7 @@ add_pto_5prime <- function(seq, n_pto_bases = PTO_N_BASES) {
 #' @return list(oligos = data.frame(oligo_name, sequence, mod5),
 #'              n_before, n_after, n_duplicates)
 generate_oligo_orders <- function(results_top,
-                                   method = "gibson",
+                                   method = "golden_gate",
                                    fwd_tail = GRNA_FWD_TAIL,
                                    rev_tail = GRNA_REV_TAIL,
                                    gg_top_overhang = GG_TOP_OVERHANG,
