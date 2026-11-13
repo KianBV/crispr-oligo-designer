@@ -6,7 +6,8 @@
 # ==============================================================================
 
 cran_packages <- c("shiny", "DT", "shinyjs", "bslib", "ggplot2",
-                   "dplyr", "stringr", "data.table", "openxlsx", "yaml")
+                   "dplyr", "stringr", "data.table", "openxlsx", "yaml",
+                   "DBI", "RSQLite")
 bioc_packages <- c("Biostrings", "GenomicFeatures", "rtracklayer")
 # The design inspector's alignment map uses ggplot2 (above). Gviz is an optional
 # alternative engine (render_design_view in R/genome_view.R) and is NOT required.

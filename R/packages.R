@@ -9,7 +9,8 @@
 # ==============================================================================
 
 # CRAN packages required by the backend + GUI
-.CRAN_PACKAGES <- c("dplyr", "stringr", "data.table", "openxlsx", "yaml")
+.CRAN_PACKAGES <- c("dplyr", "stringr", "data.table", "openxlsx", "yaml",
+                    "DBI", "RSQLite")
 
 # Bioconductor packages required by the backend
 .BIOC_PACKAGES <- c("Biostrings", "GenomicFeatures", "rtracklayer")

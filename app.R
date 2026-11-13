@@ -9,7 +9,7 @@
 # --- Load backend modules (order matters for top-level definitions) -----------
 .backend_files <- c("packages.R", "constants.R", "config.R", "genome.R",
                     "offtarget.R", "design.R", "microsynth.R", "qc.R",
-                    "genome_view.R", "pipeline.R")
+                    "genome_view.R", "pipeline.R", "tracker_db.R")
 for (.f in .backend_files) source(file.path("R", .f))
 
 load_gui_packages()
@@ -212,6 +212,10 @@ ui <- bslib::page_sidebar(
       shiny::uiOutput("inspector_header"),
       shiny::conditionalPanel(
         condition = "output.inspector_ready == true",
+        shiny::div(class = "mb-2",
+          shiny::actionButton("inspector_log_btn", "Log this design to tracker",
+                              class = "btn-outline-success btn-sm",
+                              icon = shiny::icon("floppy-disk"))),
         bslib::card(
           bslib::card_header("Alignment map (wild type vs edit)"),
           shiny::plotOutput("inspector_map", height = "300px")
@@ -237,6 +241,55 @@ ui <- bslib::page_sidebar(
     ),
 
     bslib::nav_panel(
+      "Tracker", icon = shiny::icon("database"),
+      shiny::div(
+        class = "d-flex gap-2 align-items-end mb-3 flex-wrap",
+        shiny::textInput("tracker_path", "Database file",
+                         value = tracker_default_path(CFG0), width = "360px"),
+        shiny::actionButton("tracker_connect", "Connect / create",
+                            class = "btn-primary", icon = shiny::icon("plug")),
+        shiny::actionButton("tracker_log_run", "Log current run's top picks",
+                            class = "btn-outline-success", icon = shiny::icon("floppy-disk"))
+      ),
+      shiny::uiOutput("tracker_status"),
+      bslib::navset_pill(
+        bslib::nav_panel(
+          "Edits",
+          shiny::p(shiny::tags$small(shiny::icon("hand-pointer"),
+                   " Click an edit to see its oligos and to record an attempt.")),
+          DT::DTOutput("tracker_edits_tbl"),
+          shiny::uiOutput("tracker_edit_detail")
+        ),
+        bslib::nav_panel(
+          "Attempts",
+          shiny::div(class = "mb-2",
+            shiny::actionButton("tracker_add_attempt_btn", "Record attempt",
+                                class = "btn-outline-primary btn-sm",
+                                icon = shiny::icon("plus"))),
+          DT::DTOutput("tracker_attempts_tbl")
+        ),
+        bslib::nav_panel(
+          "Curing",
+          shiny::div(class = "mb-2",
+            shiny::actionButton("tracker_add_curing_btn", "Record curing outcome",
+                                class = "btn-outline-primary btn-sm",
+                                icon = shiny::icon("plus"))),
+          DT::DTOutput("tracker_curing_tbl"),
+          shiny::h6("Curing success by strain", class = "mt-3"),
+          DT::DTOutput("tracker_curing_summary")
+        ),
+        bslib::nav_panel(
+          "Strains",
+          shiny::div(class = "mb-2",
+            shiny::actionButton("tracker_add_strain_btn", "Add / edit strain",
+                                class = "btn-outline-primary btn-sm",
+                                icon = shiny::icon("plus"))),
+          DT::DTOutput("tracker_strains_tbl")
+        )
+      )
+    ),
+
+    bslib::nav_panel(
       "Help", icon = shiny::icon("circle-question"),
       shiny::htmlOutput("help_html")
     )
@@ -252,7 +305,8 @@ server <- function(input, output, session) {
   rv <- shiny::reactiveValues(
     system = NULL, mutations = character(0), validation = NULL,
     results_all = NULL, results_top = NULL, summary = NULL,
-    n_input = 0, elapsed = NULL
+    n_input = 0, elapsed = NULL,
+    tracker_path = NULL, tracker_ready = FALSE, tracker_tick = 0
   )
 
   # ---- Effective config from base file + GUI overrides ----------------------
@@ -722,6 +776,237 @@ server <- function(input, output, session) {
                shiny::HTML(offtarget_alignment_html(d$protospacer, ot[sel[1], , drop = FALSE])))
   })
 
+  # ==== Tracker (SQLite edit database) =======================================
+
+  # Require a connected DB; notify and return FALSE otherwise.
+  tracker_require <- function() {
+    if (!isTRUE(rv$tracker_ready) || is.null(rv$tracker_path)) {
+      shiny::showNotification("Connect to a tracker database first (Tracker tab).",
+                              type = "warning")
+      return(FALSE)
+    }
+    TRUE
+  }
+
+  shiny::observeEvent(input$tracker_connect, {
+    path <- trimws(input$tracker_path %||% "")
+    if (!nzchar(path)) { shiny::showNotification("Enter a database file path.", type = "warning"); return() }
+    ok <- tryCatch({ tracker_init(path); TRUE },
+                   error = function(e) { shiny::showNotification(
+                     paste("Could not open database:", conditionMessage(e)),
+                     type = "error", duration = NULL); FALSE })
+    if (ok) {
+      rv$tracker_path <- path; rv$tracker_ready <- TRUE
+      rv$tracker_tick <- rv$tracker_tick + 1
+      shiny::showNotification(paste("Tracker ready:", path), type = "message")
+    }
+  })
+
+  output$tracker_status <- shiny::renderUI({
+    rv$tracker_tick
+    if (!isTRUE(rv$tracker_ready)) {
+      shiny::div(class = "alert alert-secondary py-2",
+        shiny::icon("circle-info"),
+        " No database connected. Set a path and click ", shiny::strong("Connect / create"),
+        ". A new .sqlite file is created if it doesn't exist.")
+    } else {
+      e <- tryCatch(tracker_edits(rv$tracker_path), error = function(err) data.frame())
+      s <- tryCatch(tracker_strains(rv$tracker_path), error = function(err) data.frame())
+      shiny::div(class = "alert alert-success py-2",
+        shiny::icon("database"), " Connected to ", shiny::code(rv$tracker_path),
+        sprintf(" — %d edit(s), %d strain(s).", nrow(e), nrow(s)))
+    }
+  })
+
+  # --- Bulk-log the current run's best design per mutation --------------------
+  shiny::observeEvent(input$tracker_log_run, {
+    if (!tracker_require()) return()
+    if (is.null(rv$results_top) || nrow(rv$results_top) == 0) {
+      shiny::showNotification("No results to log — run the design pipeline first.",
+                              type = "warning"); return() }
+    cfg <- effective_cfg()
+    method <- cfg$microsynth$cloning_method %||% "golden_gate"
+    na_mM  <- cfg$qc$na_mM %||% 50
+    genome <- rv$system$genome_name %||% NA
+    df <- rv$results_top
+    # one (best-scoring) design per mutation
+    best <- do.call(rbind, lapply(split(seq_len(nrow(df)), df$mutation), function(ix) {
+      sub <- df[ix, , drop = FALSE]; sub[which.max(sub$score), , drop = FALSE] }))
+    n <- 0
+    withCallingHandlers(
+      for (i in seq_len(nrow(best))) {
+        row <- best[i, , drop = FALSE]
+        oligos <- tryCatch(build_oligo_orders(row, cfg)$oligos, error = function(e) NULL)
+        tryCatch({ tracker_log_edit(rv$tracker_path, row, oligos, genome = genome,
+                                    cloning_method = method, na_mM = na_mM); n <- n + 1 },
+                 error = function(e) shiny::showNotification(
+                   paste("Skipped", row$mutation, "-", conditionMessage(e)), type = "error"))
+      },
+      warning = function(w) invokeRestart("muffleWarning"))
+    rv$tracker_tick <- rv$tracker_tick + 1
+    shiny::showNotification(sprintf("Logged %d edit(s) to the tracker.", n), type = "message")
+  })
+
+  # --- Log the single design currently open in the Inspector -----------------
+  shiny::observeEvent(input$inspector_log_btn, {
+    if (!tracker_require()) return()
+    d <- selected_design()
+    if (is.null(d)) { shiny::showNotification("No design selected.", type = "warning"); return() }
+    cfg <- effective_cfg()
+    oligos <- tryCatch(build_oligo_orders(d, cfg)$oligos, error = function(e) NULL)
+    ok <- tryCatch({
+      tracker_log_edit(rv$tracker_path, d, oligos,
+                       genome = rv$system$genome_name %||% NA,
+                       cloning_method = cfg$microsynth$cloning_method %||% "golden_gate",
+                       na_mM = cfg$qc$na_mM %||% 50); TRUE },
+      error = function(e) { shiny::showNotification(
+        paste("Log failed:", conditionMessage(e)), type = "error"); FALSE })
+    if (ok) {
+      rv$tracker_tick <- rv$tracker_tick + 1
+      shiny::showNotification(paste("Logged", d$mutation, "to the tracker."), type = "message")
+    }
+  })
+
+  # --- Table outputs (re-read on every write via tracker_tick) ---------------
+  .tracker_dt <- function(df, empty_msg) {
+    shiny::validate(shiny::need(!is.null(df) && nrow(df) > 0, empty_msg))
+    DT::datatable(df, rownames = FALSE, selection = "single", filter = "top",
+                  options = list(pageLength = 10, scrollX = TRUE))
+  }
+
+  output$tracker_edits_tbl <- DT::renderDT({
+    rv$tracker_tick; shiny::req(rv$tracker_ready)
+    .tracker_dt(tracker_edits(rv$tracker_path), "No edits logged yet.")
+  })
+  output$tracker_attempts_tbl <- DT::renderDT({
+    rv$tracker_tick; shiny::req(rv$tracker_ready)
+    .tracker_dt(tracker_attempts(rv$tracker_path), "No attempts recorded yet.")
+  })
+  output$tracker_curing_tbl <- DT::renderDT({
+    rv$tracker_tick; shiny::req(rv$tracker_ready)
+    .tracker_dt(tracker_curing(rv$tracker_path), "No curing outcomes recorded yet.")
+  })
+  output$tracker_curing_summary <- DT::renderDT({
+    rv$tracker_tick; shiny::req(rv$tracker_ready)
+    df <- tracker_curing_by_strain(rv$tracker_path)
+    shiny::validate(shiny::need(nrow(df) > 0, "No curing data yet."))
+    DT::datatable(df, rownames = FALSE, options = list(dom = "t"))
+  })
+  output$tracker_strains_tbl <- DT::renderDT({
+    rv$tracker_tick; shiny::req(rv$tracker_ready)
+    .tracker_dt(tracker_strains(rv$tracker_path), "No strains added yet.")
+  })
+
+  # --- Edit detail: oligos for the selected edit -----------------------------
+  output$tracker_edit_detail <- shiny::renderUI({
+    rv$tracker_tick; shiny::req(rv$tracker_ready)
+    sel <- input$tracker_edits_tbl_rows_selected
+    ed <- tracker_edits(rv$tracker_path)
+    if (is.null(sel) || length(sel) == 0 || nrow(ed) == 0) return(NULL)
+    eid <- ed$edit_id[sel[1]]
+    oligos <- tracker_oligos_for_edit(rv$tracker_path, eid)
+    bslib::card(class = "mt-3",
+      bslib::card_header(sprintf("Oligos for edit #%d (%s)", eid, ed$mutation[sel[1]])),
+      shiny::div(class = "mb-2",
+        shiny::actionButton("tracker_attempt_for_edit", "Record attempt for this edit",
+                            class = "btn-outline-primary btn-sm", icon = shiny::icon("plus"))),
+      if (nrow(oligos) == 0) shiny::em("No oligos linked.")
+      else shiny::renderTable(oligos, striped = TRUE, spacing = "xs"))
+  })
+
+  # --- Modal forms -----------------------------------------------------------
+  shiny::observeEvent(input$tracker_add_strain_btn, {
+    if (!tracker_require()) return()
+    shiny::showModal(shiny::modalDialog(
+      title = "Add / edit strain", easyClose = TRUE,
+      shiny::textInput("f_strain_name", "Name (unique) *"),
+      shiny::textInput("f_strain_parent", "Parent strain"),
+      shiny::textInput("f_strain_background", "Background (e.g. MG1655, BW25113)"),
+      shiny::textInput("f_strain_genotype", "Genotype"),
+      shiny::textAreaInput("f_strain_notes", "Notes"),
+      footer = shiny::tagList(shiny::modalButton("Cancel"),
+                              shiny::actionButton("f_strain_save", "Save", class = "btn-primary"))))
+  })
+  shiny::observeEvent(input$f_strain_save, {
+    ok <- tryCatch({
+      tracker_add_strain(rv$tracker_path, input$f_strain_name, input$f_strain_parent,
+                         input$f_strain_background, input$f_strain_genotype, input$f_strain_notes); TRUE },
+      error = function(e) { shiny::showNotification(conditionMessage(e), type = "error"); FALSE })
+    if (ok) { shiny::removeModal(); rv$tracker_tick <- rv$tracker_tick + 1
+      shiny::showNotification("Strain saved.", type = "message") }
+  })
+
+  attempt_modal <- function(preselect_edit = NULL) {
+    shiny::showModal(shiny::modalDialog(
+      title = "Record transformation attempt", easyClose = TRUE,
+      shiny::selectInput("f_at_edit", "Edit *", choices = tracker_edit_choices(rv$tracker_path),
+                         selected = preselect_edit),
+      shiny::selectInput("f_at_strain", "Target strain",
+                         choices = c("(none)" = "", tracker_strain_choices(rv$tracker_path))),
+      shiny::textInput("f_at_date", "Date", value = as.character(Sys.Date())),
+      shiny::selectInput("f_at_method", "Method",
+                         choices = c("pEcCas/pEcgRNA (lambda-Red)", "pEcCas only", "other")),
+      shiny::numericInput("f_at_colonies", "Colonies", value = NA, min = 0),
+      shiny::selectInput("f_at_screen", "Screen result",
+                         choices = c("pending", "edited", "not edited", "mixed")),
+      shiny::selectInput("f_at_seq", "Sequencing confirmed",
+                         choices = c("pending", "yes", "no")),
+      shiny::textAreaInput("f_at_notes", "Notes"),
+      footer = shiny::tagList(shiny::modalButton("Cancel"),
+                              shiny::actionButton("f_at_save", "Save", class = "btn-primary"))))
+  }
+  shiny::observeEvent(input$tracker_add_attempt_btn, { if (tracker_require()) attempt_modal() })
+  shiny::observeEvent(input$tracker_attempt_for_edit, {
+    if (!tracker_require()) return()
+    sel <- input$tracker_edits_tbl_rows_selected
+    ed <- tracker_edits(rv$tracker_path)
+    eid <- if (!is.null(sel) && length(sel)) ed$edit_id[sel[1]] else NULL
+    attempt_modal(preselect_edit = eid)
+  })
+  shiny::observeEvent(input$f_at_save, {
+    if (is.null(input$f_at_edit) || !nzchar(input$f_at_edit)) {
+      shiny::showNotification("Pick an edit.", type = "warning"); return() }
+    ok <- tryCatch({
+      tracker_add_attempt(rv$tracker_path, edit_id = input$f_at_edit,
+                          strain_id = input$f_at_strain, date = input$f_at_date,
+                          method = input$f_at_method, n_colonies = input$f_at_colonies,
+                          screen_result = input$f_at_screen, seq_confirmed = input$f_at_seq,
+                          notes = input$f_at_notes); TRUE },
+      error = function(e) { shiny::showNotification(conditionMessage(e), type = "error"); FALSE })
+    if (ok) { shiny::removeModal(); rv$tracker_tick <- rv$tracker_tick + 1
+      shiny::showNotification("Attempt recorded.", type = "message") }
+  })
+
+  shiny::observeEvent(input$tracker_add_curing_btn, {
+    if (!tracker_require()) return()
+    ch <- tracker_attempt_choices(rv$tracker_path)
+    if (length(ch) == 0) { shiny::showNotification(
+      "Record an attempt first — curing attaches to an attempt.", type = "warning"); return() }
+    shiny::showModal(shiny::modalDialog(
+      title = "Record plasmid curing", easyClose = TRUE,
+      shiny::selectInput("f_cu_attempt", "Attempt *", choices = ch),
+      shiny::selectInput("f_cu_plasmid", "Plasmid",
+                         choices = c("pEcgRNA", "pEcCas", "both")),
+      shiny::selectInput("f_cu_method", "Method",
+                         choices = c("SacB / sucrose counter-selection", "temperature (repA-ts)", "other")),
+      shiny::numericInput("f_cu_passages", "Passages", value = NA, min = 0),
+      shiny::selectInput("f_cu_cured", "Cured?", choices = c("yes", "no", "partial")),
+      shiny::textInput("f_cu_date", "Date", value = as.character(Sys.Date())),
+      shiny::textAreaInput("f_cu_notes", "Notes"),
+      footer = shiny::tagList(shiny::modalButton("Cancel"),
+                              shiny::actionButton("f_cu_save", "Save", class = "btn-primary"))))
+  })
+  shiny::observeEvent(input$f_cu_save, {
+    ok <- tryCatch({
+      tracker_add_curing(rv$tracker_path, attempt_id = input$f_cu_attempt,
+                         plasmid = input$f_cu_plasmid, method = input$f_cu_method,
+                         passages = input$f_cu_passages, cured = input$f_cu_cured,
+                         date = input$f_cu_date, notes = input$f_cu_notes); TRUE },
+      error = function(e) { shiny::showNotification(conditionMessage(e), type = "error"); FALSE })
+    if (ok) { shiny::removeModal(); rv$tracker_tick <- rv$tracker_tick + 1
+      shiny::showNotification("Curing outcome recorded.", type = "message") }
+  })
+
   # ==== Summary ==============================================================
   output$summary_text <- shiny::renderText({
     if (is.null(rv$summary)) return("No run yet.")
@@ -769,23 +1054,32 @@ server <- function(input, output, session) {
        <p>Place the official <code>MicrosynthUploadFormDNA__2_.xlsx</code> in the
           <code>templates/</code> folder (path set in <code>config/config.yml</code>),
           or upload it under <b>Settings</b>. The order form is built from the
-          top-ranked design of each mutation, with 3 oligos each
-          (<code>_pEcgRNA_fw_gibson</code>, <code>_pEcgRNA_rv_gibson</code>,
-          <code>_HA</code>), deduplicated by sequence. The two gRNA primers are
-          Gibson-assembly primers: protospacer (or its reverse complement) plus a
-          24-nt 3' homology tail matching the pEcgRNA vector.</p>
+          top-ranked design of each mutation, with 3 oligos each, deduplicated by
+          sequence. By default these are the <b>Golden Gate</b> spacer pair
+          (<code>_gg_bsaI_top</code>/<code>_bot</code>) plus the <code>_HA</code>
+          repair donor; switch to Gibson or Both under
+          <b>Settings &rarr; gRNA cloning oligos</b>.</p>
        <h4>Oligo size</h4>
        <p>The <b>Microsynth oligo size</b> (Settings) sets the homology-arm repair
           oligo length; default 100 bp. It is also configurable in
           <code>config/config.yml</code>.</p>
        <h4>Cloning method</h4>
        <p>Under <b>Settings &rarr; gRNA cloning oligos</b> choose how the spacer is
-          delivered: <b>Gibson</b> (whole-plasmid PCR primers,
-          <code>_fw_gibson</code>/<code>_rv_gibson</code>), <b>Golden Gate</b> (an
-          annealed oligo pair <code>_gg_bsaI_top</code>/<code>_bot</code> with 4-nt
-          BsaI fusion overhangs, default <code>TAGT</code>/<code>AAAC</code>, optionally
-          5'-phosphorylated), or <b>Both</b>. The <code>_HA</code> repair donor is
-          always included.</p>
+          delivered: <b>Golden Gate</b> (the default — an annealed oligo pair
+          <code>_gg_bsaI_top</code>/<code>_bot</code> with 4-nt BsaI fusion
+          overhangs, default <code>TAGT</code>/<code>AAAC</code>, optionally
+          5'-phosphorylated), <b>Gibson</b> (whole-plasmid PCR primers,
+          <code>_fw_gibson</code>/<code>_rv_gibson</code>), or <b>Both</b>. The
+          <code>_HA</code> repair donor is always included.</p>
+       <h4>Tracker</h4>
+       <p>The <b>Tracker</b> tab keeps a local SQLite database of your edits:
+          which strain each went into, the oligos ordered, transformation attempts
+          and plasmid-curing outcomes. Set a database file and click
+          <b>Connect / create</b>, then <b>Log current run's top picks</b> (or the
+          <b>Log this design</b> button in the Inspector) to record designs. Add
+          strains, attempts and curing outcomes from the tab; the <i>Curing success
+          by strain</i> table summarises outcomes. The <code>.sqlite</code> file is a
+          single portable file you can back up or query with any SQLite tool.</p>
        <h4>QC tab</h4>
        <p>Every ordered oligo is checked for GC%, nearest-neighbor Tm, longest
           hairpin stem, 3'-end self-dimer, homopolymer runs, and internal

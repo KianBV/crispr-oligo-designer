@@ -15,6 +15,11 @@ run_summary_*.txt
 # Genome cache (large, re-downloadable)
 .ecoli_grna_cache/
 
+# Tracker database(s) — personal wet-lab data, not code
+tracker/
+*.sqlite
+*.sqlite3
+
 # OS
 .DS_Store
 Thumbs.db
