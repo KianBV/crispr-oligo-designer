@@ -212,10 +212,12 @@ ui <- bslib::page_sidebar(
       shiny::uiOutput("inspector_header"),
       shiny::conditionalPanel(
         condition = "output.inspector_ready == true",
-        shiny::div(class = "mb-2",
-          shiny::actionButton("inspector_log_btn", "Log this design to tracker",
-                              class = "btn-outline-success btn-sm",
-                              icon = shiny::icon("floppy-disk"))),
+        shiny::div(class = "mb-2 d-flex gap-2 align-items-center",
+          shiny::actionButton("inspector_log_btn", "Log this chosen design to tracker",
+                              class = "btn-success btn-sm",
+                              icon = shiny::icon("floppy-disk")),
+          shiny::tags$small(class = "text-muted",
+            "Records this specific design (marked “chosen”), not the whole run.")),
         bslib::card(
           bslib::card_header("Alignment map (wild type vs edit)"),
           shiny::plotOutput("inspector_map", height = "300px")
@@ -248,10 +250,20 @@ ui <- bslib::page_sidebar(
                          value = tracker_default_path(CFG0), width = "360px"),
         shiny::actionButton("tracker_connect", "Connect / create",
                             class = "btn-primary", icon = shiny::icon("plug")),
-        shiny::actionButton("tracker_log_run", "Log current run's top picks",
-                            class = "btn-outline-success", icon = shiny::icon("floppy-disk"))
+        shiny::actionButton("tracker_log_run", "Log all top picks (best per mutation)",
+                            class = "btn-outline-success", icon = shiny::icon("layer-group"))
       ),
       shiny::uiOutput("tracker_status"),
+      shiny::div(
+        class = "d-flex gap-2 align-items-center mb-3 flex-wrap",
+        shiny::tags$small(class = "text-muted", "Export CSV:"),
+        shiny::downloadButton("tracker_dl_flat", "Edits + outcomes (flat)",
+                              class = "btn-outline-secondary btn-sm"),
+        shiny::downloadButton("tracker_dl_edits", "Edits", class = "btn-outline-secondary btn-sm"),
+        shiny::downloadButton("tracker_dl_attempts", "Attempts", class = "btn-outline-secondary btn-sm"),
+        shiny::downloadButton("tracker_dl_curing", "Curing", class = "btn-outline-secondary btn-sm"),
+        shiny::downloadButton("tracker_dl_strains", "Strains", class = "btn-outline-secondary btn-sm")
+      ),
       bslib::navset_pill(
         bslib::nav_panel(
           "Edits",
@@ -858,7 +870,7 @@ server <- function(input, output, session) {
       tracker_log_edit(rv$tracker_path, d, oligos,
                        genome = rv$system$genome_name %||% NA,
                        cloning_method = cfg$microsynth$cloning_method %||% "golden_gate",
-                       na_mM = cfg$qc$na_mM %||% 50); TRUE },
+                       status = "chosen", na_mM = cfg$qc$na_mM %||% 50); TRUE },
       error = function(e) { shiny::showNotification(
         paste("Log failed:", conditionMessage(e)), type = "error"); FALSE })
     if (ok) {
@@ -896,6 +908,20 @@ server <- function(input, output, session) {
     rv$tracker_tick; shiny::req(rv$tracker_ready)
     .tracker_dt(tracker_strains(rv$tracker_path), "No strains added yet.")
   })
+
+  # --- CSV exports -----------------------------------------------------------
+  .tracker_dl <- function(tag, getter) shiny::downloadHandler(
+    filename = function() sprintf("tracker_%s_%s.csv", tag, Sys.Date()),
+    content = function(file) {
+      df <- if (isTRUE(rv$tracker_ready))
+        tryCatch(getter(rv$tracker_path), error = function(e) data.frame()) else data.frame()
+      utils::write.csv(df, file, row.names = FALSE, na = "")
+    })
+  output$tracker_dl_flat     <- .tracker_dl("edits_outcomes", tracker_export_flat)
+  output$tracker_dl_edits    <- .tracker_dl("edits",    tracker_edits)
+  output$tracker_dl_attempts <- .tracker_dl("attempts", tracker_attempts)
+  output$tracker_dl_curing   <- .tracker_dl("curing",   tracker_curing)
+  output$tracker_dl_strains  <- .tracker_dl("strains",  tracker_strains)
 
   # --- Edit detail: oligos for the selected edit -----------------------------
   output$tracker_edit_detail <- shiny::renderUI({
@@ -946,8 +972,10 @@ server <- function(input, output, session) {
       shiny::textInput("f_at_date", "Date", value = as.character(Sys.Date())),
       shiny::selectInput("f_at_method", "Method",
                          choices = c("pEcCas/pEcgRNA (lambda-Red)", "pEcCas only", "other")),
+      shiny::selectInput("f_at_transformation", "Transformation success",
+                         choices = c("pending", "success", "low efficiency", "failed")),
       shiny::numericInput("f_at_colonies", "Colonies", value = NA, min = 0),
-      shiny::selectInput("f_at_screen", "Screen result",
+      shiny::selectInput("f_at_screen", "Edit screen result",
                          choices = c("pending", "edited", "not edited", "mixed")),
       shiny::selectInput("f_at_seq", "Sequencing confirmed",
                          choices = c("pending", "yes", "no")),
@@ -969,7 +997,8 @@ server <- function(input, output, session) {
     ok <- tryCatch({
       tracker_add_attempt(rv$tracker_path, edit_id = input$f_at_edit,
                           strain_id = input$f_at_strain, date = input$f_at_date,
-                          method = input$f_at_method, n_colonies = input$f_at_colonies,
+                          method = input$f_at_method, transformation = input$f_at_transformation,
+                          n_colonies = input$f_at_colonies,
                           screen_result = input$f_at_screen, seq_confirmed = input$f_at_seq,
                           notes = input$f_at_notes); TRUE },
       error = function(e) { shiny::showNotification(conditionMessage(e), type = "error"); FALSE })
@@ -1075,11 +1104,24 @@ server <- function(input, output, session) {
        <p>The <b>Tracker</b> tab keeps a local SQLite database of your edits:
           which strain each went into, the oligos ordered, transformation attempts
           and plasmid-curing outcomes. Set a database file and click
-          <b>Connect / create</b>, then <b>Log current run's top picks</b> (or the
-          <b>Log this design</b> button in the Inspector) to record designs. Add
-          strains, attempts and curing outcomes from the tab; the <i>Curing success
-          by strain</i> table summarises outcomes. The <code>.sqlite</code> file is a
-          single portable file you can back up or query with any SQLite tool.</p>
+          <b>Connect / create</b>.</p>
+       <p><b>Adding designs.</b> Two ways: <b>Log all top picks (best per
+          mutation)</b> on the Tracker tab logs the whole run at once (status
+          <i>designed</i>); or select a design in <b>Results</b> &rarr; inspect it,
+          and click <b>Log this chosen design</b> in the Inspector to record just
+          that one (status <i>chosen</i>, which is never downgraded by a later bulk
+          log). Re-logging the same design never duplicates it.</p>
+       <p><b>Recording outcomes.</b> On the <b>Attempts</b> tab (or the
+          <i>Record attempt for this edit</i> button under an edit) log each
+          transformation: pick the edit and strain, and record
+          <b>Transformation success</b> (did the transformation/recombineering
+          work) separately from the <b>Edit screen result</b> and sequencing. On the
+          <b>Curing</b> tab, attach a plasmid-curing outcome to an attempt; the
+          <i>Curing success by strain</i> table summarises it.</p>
+       <p><b>Export.</b> The <b>Export CSV</b> buttons download any table, or a
+          single flat <i>Edits + outcomes</i> sheet (edits joined to attempts and
+          curing) for sharing. The <code>.sqlite</code> file itself is one portable
+          file you can back up or open in any SQLite tool.</p>
        <h4>QC tab</h4>
        <p>Every ordered oligo is checked for GC%, nearest-neighbor Tm, longest
           hairpin stem, 3'-end self-dimer, homopolymer runs, and internal

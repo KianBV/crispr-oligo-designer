@@ -100,16 +100,17 @@ tracker_init <- function(path) {
       );")
     DBI::dbExecute(con, "
       CREATE TABLE IF NOT EXISTS attempts (
-        attempt_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-        edit_id       INTEGER NOT NULL REFERENCES edits(edit_id) ON DELETE CASCADE,
-        strain_id     INTEGER REFERENCES strains(strain_id) ON DELETE SET NULL,
-        date          TEXT,
-        method        TEXT,
-        n_colonies    INTEGER,
-        screen_result TEXT,
-        seq_confirmed TEXT,
-        notes         TEXT,
-        created       TEXT DEFAULT (datetime('now'))
+        attempt_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        edit_id        INTEGER NOT NULL REFERENCES edits(edit_id) ON DELETE CASCADE,
+        strain_id      INTEGER REFERENCES strains(strain_id) ON DELETE SET NULL,
+        date           TEXT,
+        method         TEXT,
+        transformation TEXT,
+        n_colonies     INTEGER,
+        screen_result  TEXT,
+        seq_confirmed  TEXT,
+        notes          TEXT,
+        created        TEXT DEFAULT (datetime('now'))
       );")
     DBI::dbExecute(con, "
       CREATE TABLE IF NOT EXISTS curing (
@@ -123,8 +124,21 @@ tracker_init <- function(path) {
         notes      TEXT,
         created    TEXT DEFAULT (datetime('now'))
       );")
+    .tracker_migrate(con)
     invisible(TRUE)
   })
+}
+
+#' Add columns introduced after a database was first created. SQLite has no
+#' "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info first. Idempotent.
+.tracker_migrate <- function(con) {
+  has_col <- function(tbl, col) {
+    info <- DBI::dbGetQuery(con, sprintf("PRAGMA table_info(%s);", tbl))
+    col %in% info$name
+  }
+  if (!has_col("attempts", "transformation"))
+    DBI::dbExecute(con, "ALTER TABLE attempts ADD COLUMN transformation TEXT;")
+  invisible(TRUE)
 }
 
 # ------------------------------------------------------------------------------
@@ -184,7 +198,9 @@ tracker_log_edit <- function(path, design_row, oligos_df, genome = NA,
        VALUES (:mut,:gene,:pos,:wt,:mt,:gen,:sc,:st,:pr,:pm,:ha,:cm,:ds,:stat)
        ON CONFLICT(mutation, protospacer, genome) DO UPDATE SET
          score=excluded.score, pam_mutation=excluded.pam_mutation,
-         homology_arm=excluded.homology_arm, cloning_method=excluded.cloning_method;",
+         homology_arm=excluded.homology_arm, cloning_method=excluded.cloning_method,
+         -- upgrade to 'chosen' when logged as such; never downgrade back
+         status=CASE WHEN excluded.status='chosen' THEN 'chosen' ELSE edits.status END;",
       params = list(
         mut = mut, gene = .na_if_empty(d$gene), pos = suppressWarnings(as.integer(d$position)),
         wt = .na_if_empty(d$wt_aa), mt = .na_if_empty(d$mut_aa), gen = gen,
@@ -225,17 +241,20 @@ tracker_log_edit <- function(path, design_row, oligos_df, genome = NA,
   })
 }
 
-#' Record a transformation attempt of an edit into a strain.
+#' Record a transformation attempt of an edit into a strain. `transformation`
+#' captures whether the transformation/recombineering itself worked (e.g.
+#' "success", "failed", "low efficiency"); `screen_result`/`seq_confirmed`
+#' capture whether the intended edit was obtained.
 tracker_add_attempt <- function(path, edit_id, strain_id = NA, date = NA,
-                                method = NA, n_colonies = NA, screen_result = NA,
-                                seq_confirmed = NA, notes = NA) {
+                                method = NA, transformation = NA, n_colonies = NA,
+                                screen_result = NA, seq_confirmed = NA, notes = NA) {
   tracker_with(path, function(con) {
     DBI::dbExecute(con,
       "INSERT INTO attempts
-         (edit_id, strain_id, date, method, n_colonies, screen_result, seq_confirmed, notes)
-       VALUES (:e,:s,:d,:m,:n,:r,:c,:o);",
+         (edit_id, strain_id, date, method, transformation, n_colonies, screen_result, seq_confirmed, notes)
+       VALUES (:e,:s,:d,:m,:tr,:n,:r,:c,:o);",
       params = list(e = as.integer(edit_id), s = suppressWarnings(as.integer(.na_if_empty(strain_id))),
-                    d = .na_if_empty(date), m = .na_if_empty(method),
+                    d = .na_if_empty(date), m = .na_if_empty(method), tr = .na_if_empty(transformation),
                     n = suppressWarnings(as.integer(.na_if_empty(n_colonies))),
                     r = .na_if_empty(screen_result), c = .na_if_empty(seq_confirmed),
                     o = .na_if_empty(notes)))
@@ -291,7 +310,7 @@ tracker_attempts <- function(path) {
   tracker_with(path, function(con)
     DBI::dbGetQuery(con,
       "SELECT a.attempt_id, e.mutation, s.name AS strain, a.date, a.method,
-              a.n_colonies, a.screen_result, a.seq_confirmed, a.notes
+              a.transformation, a.n_colonies, a.screen_result, a.seq_confirmed, a.notes
        FROM attempts a
        JOIN edits e ON e.edit_id=a.edit_id
        LEFT JOIN strains s ON s.strain_id=a.strain_id
@@ -322,6 +341,33 @@ tracker_curing_by_strain <- function(path) {
        JOIN attempts a ON a.attempt_id=c.attempt_id
        LEFT JOIN strains s ON s.strain_id=a.strain_id
        GROUP BY strain ORDER BY n DESC;"))
+}
+
+#' One wide, flat table joining edits -> attempts -> curing (+ strain), for
+#' CSV export / sharing. LEFT JOINs so an edit with no attempt, or an attempt
+#' with no curing record, still appears (outcome columns NA).
+tracker_export_flat <- function(path) {
+  tracker_with(path, function(con)
+    DBI::dbGetQuery(con,
+      "SELECT e.edit_id, e.mutation, e.gene, e.wt_aa, e.mut_aa, e.genome,
+              e.strand, e.score, e.cloning_method, e.status AS design_status,
+              e.protospacer, e.pam_mutation, e.date_designed,
+              a.attempt_id, s.name AS strain, a.date AS attempt_date, a.method,
+              a.transformation, a.n_colonies, a.screen_result, a.seq_confirmed,
+              a.notes AS attempt_notes,
+              c.plasmid AS cured_plasmid, c.method AS cure_method,
+              c.passages, c.cured, c.date AS cure_date
+       FROM edits e
+       LEFT JOIN attempts a ON a.edit_id=e.edit_id
+       LEFT JOIN strains  s ON s.strain_id=a.strain_id
+       LEFT JOIN curing   c ON c.attempt_id=a.attempt_id
+       ORDER BY e.edit_id, a.attempt_id, c.curing_id;"))
+}
+
+#' Named table-getters keyed by a short label, used by the CSV export UI.
+tracker_table_exporters <- function() {
+  list(edits = tracker_edits, attempts = tracker_attempts, curing = tracker_curing,
+       strains = tracker_strains, flat = tracker_export_flat)
 }
 
 #' Convenience: (edit_id, mutation) choices for selectInputs.
