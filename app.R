@@ -931,13 +931,39 @@ server <- function(input, output, session) {
     if (is.null(sel) || length(sel) == 0 || nrow(ed) == 0) return(NULL)
     eid <- ed$edit_id[sel[1]]
     oligos <- tracker_oligos_for_edit(rv$tracker_path, eid)
+    note <- tracker_edit_note(rv$tracker_path, eid)
     bslib::card(class = "mt-3",
-      bslib::card_header(sprintf("Oligos for edit #%d (%s)", eid, ed$mutation[sel[1]])),
-      shiny::div(class = "mb-2",
+      bslib::card_header(sprintf("Edit #%d (%s)", eid, ed$mutation[sel[1]])),
+      shiny::div(class = "mb-2 d-flex gap-2",
         shiny::actionButton("tracker_attempt_for_edit", "Record attempt for this edit",
                             class = "btn-outline-primary btn-sm", icon = shiny::icon("plus"))),
+      shiny::div(
+        class = "mb-3",
+        shiny::textAreaInput("tracker_edit_note", "Notes / comments for this edit",
+                             value = note, width = "100%", rows = 3,
+                             placeholder = "e.g. ordered 2026-11-20; weak gRNA, try alt design; ..."),
+        shiny::actionButton("tracker_save_note", "Save note",
+                            class = "btn-primary btn-sm", icon = shiny::icon("floppy-disk"))),
+      shiny::tags$h6("Oligos"),
       if (nrow(oligos) == 0) shiny::em("No oligos linked.")
       else shiny::renderTable(oligos, striped = TRUE, spacing = "xs"))
+  })
+
+  # Save the note for the currently selected edit.
+  shiny::observeEvent(input$tracker_save_note, {
+    if (!tracker_require()) return()
+    sel <- input$tracker_edits_tbl_rows_selected
+    ed <- tracker_edits(rv$tracker_path)
+    if (is.null(sel) || length(sel) == 0 || nrow(ed) == 0) {
+      shiny::showNotification("Select an edit first.", type = "warning"); return() }
+    eid <- ed$edit_id[sel[1]]
+    ok <- tryCatch({ tracker_update_edit_note(rv$tracker_path, eid, input$tracker_edit_note); TRUE },
+                   error = function(e) { shiny::showNotification(conditionMessage(e), type = "error"); FALSE })
+    # Note: deliberately do NOT bump tracker_tick here — re-rendering the edits
+    # table would clear the row selection and collapse this detail panel. The DB
+    # is updated and the textarea keeps the saved text; the table's notes column
+    # refreshes on its next render.
+    if (ok) shiny::showNotification(sprintf("Note saved for edit #%d.", eid), type = "message")
   })
 
   # --- Modal forms -----------------------------------------------------------

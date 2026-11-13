@@ -286,9 +286,27 @@ tracker_edits <- function(path) {
       "SELECT e.edit_id, e.mutation, e.gene, e.genome, e.strand, e.score,
               e.cloning_method, e.status, e.date_designed,
               (SELECT COUNT(*) FROM edit_oligos eo WHERE eo.edit_id=e.edit_id) AS n_oligos,
-              (SELECT COUNT(*) FROM attempts a WHERE a.edit_id=e.edit_id)      AS n_attempts
+              (SELECT COUNT(*) FROM attempts a WHERE a.edit_id=e.edit_id)      AS n_attempts,
+              e.notes
        FROM edits e ORDER BY e.edit_id DESC;")
   })
+}
+
+#' Current free-text note on one edit (NA -> "").
+tracker_edit_note <- function(path, edit_id) {
+  tracker_with(path, function(con) {
+    v <- DBI::dbGetQuery(con, "SELECT notes FROM edits WHERE edit_id=:e",
+                         params = list(e = as.integer(edit_id)))$notes
+    if (length(v) == 0 || is.na(v[1])) "" else v[1]
+  })
+}
+
+#' Set/replace the free-text note on one edit.
+tracker_update_edit_note <- function(path, edit_id, notes) {
+  tracker_with(path, function(con)
+    DBI::dbExecute(con, "UPDATE edits SET notes=:n WHERE edit_id=:e",
+                   params = list(n = .na_if_empty(notes), e = as.integer(edit_id))))
+  invisible(TRUE)
 }
 
 tracker_strains <- function(path) {
@@ -351,7 +369,7 @@ tracker_export_flat <- function(path) {
     DBI::dbGetQuery(con,
       "SELECT e.edit_id, e.mutation, e.gene, e.wt_aa, e.mut_aa, e.genome,
               e.strand, e.score, e.cloning_method, e.status AS design_status,
-              e.protospacer, e.pam_mutation, e.date_designed,
+              e.notes AS design_notes, e.protospacer, e.pam_mutation, e.date_designed,
               a.attempt_id, s.name AS strain, a.date AS attempt_date, a.method,
               a.transformation, a.n_colonies, a.screen_result, a.seq_confirmed,
               a.notes AS attempt_notes,
